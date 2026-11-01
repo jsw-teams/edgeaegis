@@ -132,6 +132,10 @@ Private bundles live under `tools/.build/<platform>/deploy/`. Repository imports
 
 **Trusted transport metadata is required.** Cloudflare reads platform metadata; Node reads its connection. Fetch-only adapters require original protocol/IP information signed by a trusted ingress using the optional `ingressKey` in `secret/credentials.yml`. Missing or forged metadata returns 503. Use `createIngressForwarder` from `edgeaegis/ingress` in an existing trusted Node/Worker ingress, passing the actual protocol/IP and available raw target. Signatures bind the method, destination, original URL, metadata and timestamp. Client-supplied forwarding headers are not trusted. A platform setup screen alone does not establish this trust.
 
+## MPTCP transport-layer security boundary
+
+EdgeAegis inspects **HTTP traffic**, not raw MPTCP options or Linux kernel state. An HTTP attack carried over a correctly established MPTCP transport can still be inspected, but MPTCP kernel CVEs (for example, malformed DSS options or subflow races) must be addressed by the kernel/ingress operator. A successful CRS or HTTP test **does not** prove that EdgeAegis blocks MPTCP kernel vulnerabilities. See [MPTCP threat model and safe verification](docs/mptcp-security.md).
+
 ## Native rules and updates
 
 `rules/config.yml` selects rule files, separately from origin configuration:
