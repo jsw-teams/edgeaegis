@@ -180,6 +180,13 @@ CI covers Windows/Linux and Node 22/24, full CRS PL1–4, five built adapters, r
 
 Releases use `YYYY.M.monthly-release-number`, starting at `2026.10.1`, with tags such as `v2026.10.1`, matching EdgePress. Earlier naming experiments are test history. GitHub Actions `publish.yml` verifies and publishes the same hashed npm archive through Trusted Publishing/OIDC, checks public installation and the `latest` tag, and requires no stored npm token.
 
+
+## MPTCP transport security boundary
+
+EdgeAegis inspects HTTP requests and responses **after** a trusted network/HTTP ingress has received the connection. MPTCP is negotiated in the Linux TCP stack before SecLang can inspect a request. **EdgeAegis is not a mitigation for Linux MPTCP kernel CVEs**, including malformed DSS options, MP_JOIN state defects, or denial-of-service in the kernel's receive path. Patch the affected kernel or disable MPTCP at the system/network boundary where required.
+
+The regression test `tools/tests/mptcp-transport.test.ts` uses an isolated loopback MPTCP listener/client, forwards their HTTP bytes to the Node adapter, and confirms that a harmless request passes while a rule-matching request receives HTTP 403 **without reaching the origin**. It probes `MPTCP_INFO` on both endpoints; unsupported MPTCP is explicitly reported as **skipped**, not passed. No exploit packets or public targets are involved. This verifies *application-layer enforcement over negotiated MPTCP transport*, **not** protection against MPTCP kernel vulnerabilities.
+
 ## Agent contributions and security reports
 
 Vibe Coding and AI-assisted contributions are welcome. Humans remain responsible for the submitted code and evidence. Read [AGENTS.md](AGENTS.md), explain the change, and run the relevant regression tests **before uploading a branch or PR**. Engine, parser, rule or adapter changes require `npm run check`, `npm run test:crs`, `npm run cloudflare:dry-run` and `npm run audit`. Include commands, runtime, results and any unrun checks; never substitute generated output for an actual run or remove rules to improve results. Documentation-only changes require checking the documented commands, links and examples; identify checks that do not apply.
