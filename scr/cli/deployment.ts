@@ -5,6 +5,7 @@ import { type DeploymentConfig, validateDeploymentConfig } from "../config.js";
 import { canonicalPath } from "../http-boundary/index.js";
 import type { BusinessFunction, OriginSettings, PlatformName } from "../origin/types.js";
 import type { Route } from "../runtime/index.js";
+import { resolveL4ResourceLimits, validateL4ForwardRules } from "../runtime/l4.js";
 import { readData } from "./config.js";
 
 function record(value: unknown, label: string): Record<string, any> {
@@ -271,6 +272,8 @@ export async function readDeployment(path: string, platform?: PlatformName) {
     localRulesFile: rulePath("local"),
     allowlistFile: rulePath("allowlist"),
   });
+  if (config.l4Forwarders) validateL4ForwardRules(config.l4Forwarders);
+  if (config.l4Limits) resolveL4ResourceLimits(config.l4Limits);
   config.secretFile = resolve(directory, config.secretFile);
   if (config.responses) config.responses.directory = resolve(directory, config.responses.directory);
   return { config, businesses, originRoot, platformRoot };

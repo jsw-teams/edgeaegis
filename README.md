@@ -37,6 +37,24 @@ From a source checkout, use `npm install` followed by the same platform commands
 
 The Node listener defaults to loopback. Put your TLS ingress in front of it and use a hostname configured in `origin/config.yml`.
 
+For a VPS deployment, `config.yml` can also declare fixed-target TCP/UDP Layer 4 forwarders. Every listener requires literal IP endpoints and an explicit source CIDR allowlist; each rule has a bounded session count and idle timeout. TCP streams use Node socket backpressure. Process-wide TCP/UDP defaults scale with detected host memory and can be raised with `l4Limits`; validated upper bounds are 65,536 concurrent sessions and 256 MiB of queued UDP packets. Raw Layer 4 payloads are not HTTP and cannot be inspected by SecLang; keep these rules limited to protocols that need transport forwarding, and send HTTP, gRPC, and HTTP/3 traffic through the EdgeAegis HTTP route policy. Changing forwarder listeners or resource budgets requires a service restart.
+
+```yaml
+l4Forwarders:
+  - protocol: tcp
+    listen: { host: 0.0.0.0, port: 8443 }
+    target: { host: 10.0.0.8, port: 443 }
+    allowSources: [198.51.100.0/24]
+    maxConnections: 128
+    idleTimeoutMs: 120000
+l4Limits:
+  maxTcpConnections: 8192
+  maxUdpSessions: 16384
+  udpPendingBytes: 33554432
+```
+
+Use narrow source CIDRs for public deployments. Do not use `0.0.0.0/0` or `::/0` as a convenience default. The example address ranges are documentation-only.
+
 For production over SSH, install a supervised **background service**, so the firewall survives a closed terminal:
 
 ```sh
@@ -213,6 +231,8 @@ npm run deploy:cloudflare
 ```
 
 通过 SSH 在 Linux/VPS 长期运行时，使用 `npx edgeaegis service install config.yml --system` 安装 systemd 后台服务，使用 `npx edgeaegis service status config.yml --system` 查看状态。需要相应管理权限；`deploy:local` 是前台开发命令。安装 npm 包不会自动开启后台服务。
+
+VPS 的 `config.yml` 可声明固定目标 TCP/UDP 四层转发。每条规则都必须填写字面 IP 目标和来源 CIDR 白名单，并可设置并发连接数与空闲超时。TCP 使用流式背压；TCP/UDP 进程级默认预算根据检测到的主机内存计算，也可通过 `l4Limits` 调高。经过校验的上限为 65,536 个并发会话和 256 MiB UDP 待发包内存。四层载荷不是 HTTP，不能由 SecLang 检查；HTTP、gRPC 和 HTTP/3 应进入 EdgeAegis HTTP 路由策略。修改四层监听或资源预算后需重启服务。不要使用 `0.0.0.0/0` 或 `::/0` 作为默认白名单。
 
 上方 GIF 来自真实隔离虚拟机终端，演示多个业务、独立回源密钥、真实 curl 响应、完整 CRS 拦截与临时封禁到期恢复。全部示例地址和密钥属于一次性实验环境。CRS 定时跟踪最新稳定版，完整验证后才更新；来源提交与哈希用于核验，不作为永久锁定。白名单和自定义拒绝页面始终由部署者控制。
 

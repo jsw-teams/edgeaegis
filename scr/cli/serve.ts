@@ -4,6 +4,7 @@ import { originCredential } from "../config.js";
 import { digest, stableJson } from "../core/types.js";
 import { createRelayTransport } from "../origin/relay.js";
 import { type AllowlistEntry, createShield } from "../runtime/index.js";
+import { startL4Forwarders } from "../runtime/l4.js";
 import { createNodeServer } from "../runtime/node.js";
 import { loadSecLangDeployment } from "../seclang/node.js";
 import { readCredentials, readData } from "./config.js";
@@ -108,6 +109,7 @@ export async function serve(path: string): Promise<void> {
   }
   let current = (await candidate())!;
   fingerprint = current.hash;
+  const l4 = await startL4Forwarders(current.config.l4Forwarders ?? [], current.config.l4Limits);
   let nextReload = Date.now() + 1000,
     reloading: Promise<void> | undefined;
   const server = createNodeServer(
@@ -117,7 +119,12 @@ export async function serve(path: string): Promise<void> {
         reloading = candidate()
           .then((next) => {
             if (!next) return;
-            if (stableJson(next.config.listen) !== stableJson(current.config.listen)) {
+            if (
+              stableJson(next.config.listen) !== stableJson(current.config.listen) ||
+              stableJson(next.config.l4Forwarders ?? []) !==
+                stableJson(current.config.l4Forwarders ?? []) ||
+              stableJson(next.config.l4Limits ?? {}) !== stableJson(current.config.l4Limits ?? {})
+            ) {
               next.engine.dispose();
               throw new Error("Listener changes require restart");
             }
@@ -164,6 +171,7 @@ export async function serve(path: string): Promise<void> {
     server.close(() => {
       current.engine.dispose();
     });
+    void l4.close();
     server.closeIdleConnections();
     setTimeout(() => server.closeAllConnections(), 5000).unref();
   };

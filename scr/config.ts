@@ -2,6 +2,7 @@ import { parseDocument } from "yaml";
 import type { BoundaryLimits } from "./http-boundary/index.js";
 import type { PlatformName } from "./origin/types.js";
 import type { Route } from "./runtime/index.js";
+import type { L4ForwardRule, L4ResourceLimits } from "./runtime/l4.js";
 export interface DeploymentConfig {
   platform: PlatformName;
   tenant: string;
@@ -21,6 +22,8 @@ export interface DeploymentConfig {
   allowLoopbackHttp?: boolean;
   limits?: Partial<BoundaryLimits>;
   maxConcurrentRequests?: number;
+  l4Forwarders?: L4ForwardRule[];
+  l4Limits?: L4ResourceLimits;
   responses?: { directory: string; contentSecurityPolicy: string };
 }
 export interface ProjectCredentials {
@@ -56,6 +59,8 @@ export function validateDeploymentConfig(value: unknown): DeploymentConfig {
     "allowLoopbackHttp",
     "limits",
     "maxConcurrentRequests",
+    "l4Forwarders",
+    "l4Limits",
     "responses",
   ];
   if (
@@ -88,6 +93,16 @@ export function validateDeploymentConfig(value: unknown): DeploymentConfig {
     )
       throw new Error("Every route must select a configured business");
   }
+  if (
+    config.l4Forwarders !== undefined &&
+    (!Array.isArray(config.l4Forwarders) || config.l4Forwarders.length > 64)
+  )
+    throw new Error("Invalid L4 forwarding rules");
+  if (
+    config.l4Limits !== undefined &&
+    (!config.l4Limits || typeof config.l4Limits !== "object" || Array.isArray(config.l4Limits))
+  )
+    throw new Error("Invalid L4 resource limits");
   for (const host of config.publicHosts) {
     const publicUrl = new URL(`https://${host}`);
     if (
