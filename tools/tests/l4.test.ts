@@ -125,6 +125,52 @@ test("TCP source rejected by the ACL never opens a target connection", {
   }
 });
 
+test("L4 per-source burst limits stop repeated connection floods", {
+  timeout: 5000,
+}, async () => {
+  let targetConnections = 0;
+  const target = createServer((socket) => {
+    targetConnections++;
+    socket.pipe(socket);
+  });
+  target.listen(0, "127.0.0.1");
+  await once(target, "listening");
+  const listenPort = await freeTcpPort();
+  const forwarding = await startL4Forwarders([
+    {
+      protocol: "tcp",
+      listen: { host: "127.0.0.1", port: listenPort },
+      target: { host: "127.0.0.1", port: (target.address() as { port: number }).port },
+      allowSources: ["127.0.0.1/32"],
+      maxEventsPerSecond: 1,
+      burstEvents: 1,
+      idleTimeoutMs: 5000,
+    },
+  ]);
+  try {
+    const net = await import("node:net");
+    const first = net.createConnection({ host: "127.0.0.1", port: listenPort });
+    await once(first, "connect");
+    const response = once(first, "data");
+    first.write("first");
+    assert.equal((await response)[0]?.toString(), "first");
+    const firstClosed = new Promise<void>((resolve) => first.once("close", () => resolve()));
+    first.destroy();
+    await firstClosed;
+
+    const second = net.createConnection({ host: "127.0.0.1", port: listenPort });
+    second.on("error", () => {});
+    const secondClosed = new Promise<void>((resolve) => second.once("close", () => resolve()));
+    await once(second, "connect");
+    second.write("flood");
+    await secondClosed;
+    assert.equal(targetConnections, 1);
+  } finally {
+    await forwarding.close();
+    await new Promise<void>((resolve) => target.close(() => resolve()));
+  }
+});
+
 test("UDP forwarding keeps bounded per-client reply paths", { timeout: 5000 }, async () => {
   const target = createSocket("udp4");
   target.on("message", (message, peer) => target.send(message, peer.port, peer.address));
@@ -149,6 +195,48 @@ test("UDP forwarding keeps bounded per-client reply paths", { timeout: 5000 }, a
     const received = once(client, "message");
     client.send("dns", listenPort, "127.0.0.1");
     assert.equal((await received)[0].toString(), "dns");
+  } finally {
+    client.close();
+    await once(client, "close");
+    await forwarding.close();
+    target.close();
+    await once(target, "close");
+  }
+});
+
+test("UDP per-source token bucket drops excess packets before the target", {
+  timeout: 5000,
+}, async () => {
+  let forwarded = 0;
+  const target = createSocket("udp4");
+  target.on("message", (message, peer) => {
+    forwarded++;
+    target.send(message, peer.port, peer.address);
+  });
+  target.bind(0, "127.0.0.1");
+  await once(target, "listening");
+  const listenPort = await freeUdpPort();
+  const forwarding = await startL4Forwarders([
+    {
+      protocol: "udp",
+      listen: { host: "127.0.0.1", port: listenPort },
+      target: { host: "127.0.0.1", port: target.address().port },
+      allowSources: ["127.0.0.1/32"],
+      maxEventsPerSecond: 1,
+      burstEvents: 1,
+      idleTimeoutMs: 5000,
+    },
+  ]);
+  const client = createSocket("udp4");
+  try {
+    client.bind(0, "127.0.0.1");
+    await once(client, "listening");
+    const first = once(client, "message");
+    client.send("first", listenPort, "127.0.0.1");
+    assert.equal((await first)[0].toString(), "first");
+    client.send("excess", listenPort, "127.0.0.1");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(forwarded, 1);
   } finally {
     client.close();
     await once(client, "close");

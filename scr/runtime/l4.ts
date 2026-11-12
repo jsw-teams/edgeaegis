@@ -11,7 +11,17 @@ export interface L4ForwardRule {
   /** Required source CIDRs; an empty allowlist is rejected. */
   allowSources: readonly string[];
   maxConnections?: number;
+  maxSessionsPerSource?: number;
+  maxEventsPerSecond?: number;
+  burstEvents?: number;
   idleTimeoutMs?: number;
+}
+
+interface SourceState {
+  tokens: number;
+  updatedAt: number;
+  lastSeen: number;
+  sessions: number;
 }
 
 export interface L4ResourceLimits {
@@ -71,6 +81,9 @@ function compileRule(input: L4ForwardRule) {
           "target",
           "allowSources",
           "maxConnections",
+          "maxSessionsPerSource",
+          "maxEventsPerSecond",
+          "burstEvents",
           "idleTimeoutMs",
         ].includes(key),
     ) ||
@@ -97,12 +110,39 @@ function compileRule(input: L4ForwardRule) {
   });
   const maxConnections =
     input.maxConnections ?? Math.min(16384, Math.max(1024, Math.floor(totalmem() / (1024 * 1024))));
+  const maxSessionsPerSource = input.maxSessionsPerSource ?? 2048;
+  const maxEventsPerSecond = input.maxEventsPerSecond ?? 2000;
+  const burstEvents = input.burstEvents ?? 4000;
   const idleTimeoutMs = input.idleTimeoutMs ?? 120000;
   if (!Number.isInteger(maxConnections) || maxConnections < 1 || maxConnections > 65536)
     throw new Error("L4 maxConnections must be between 1 and 65536");
   if (!Number.isInteger(idleTimeoutMs) || idleTimeoutMs < 1000 || idleTimeoutMs > 3600000)
     throw new Error("L4 idleTimeoutMs must be between 1000 and 3600000");
-  return { ...input, listenHost, targetHost, sources, maxConnections, idleTimeoutMs };
+  if (
+    !Number.isInteger(maxSessionsPerSource) ||
+    maxSessionsPerSource < 1 ||
+    maxSessionsPerSource > 65536
+  )
+    throw new Error("L4 maxSessionsPerSource must be between 1 and 65536");
+  if (
+    !Number.isInteger(maxEventsPerSecond) ||
+    maxEventsPerSecond < 1 ||
+    maxEventsPerSecond > 100000
+  )
+    throw new Error("L4 maxEventsPerSecond must be between 1 and 100000");
+  if (!Number.isInteger(burstEvents) || burstEvents < 1 || burstEvents > 1000000)
+    throw new Error("L4 burstEvents must be between 1 and 1000000");
+  return {
+    ...input,
+    listenHost,
+    targetHost,
+    sources,
+    maxConnections,
+    maxSessionsPerSource,
+    maxEventsPerSecond,
+    burstEvents,
+    idleTimeoutMs,
+  };
 }
 
 export function validateL4ForwardRules(rules: readonly L4ForwardRule[]): void {
@@ -155,6 +195,7 @@ export async function startL4Forwarders(
     queuedBytes: number;
     pending?: Buffer[];
   }>();
+  const sourceStates = new Map<string, SourceState>();
   let stopped = false;
   let udpQueuedBytes = 0;
   const UDP_PENDING_LIMIT = limits.udpPendingBytes;
@@ -162,27 +203,65 @@ export async function startL4Forwarders(
     validateL4ForwardRules(rules);
     for (const raw of rules) {
       const rule = compileRule(raw);
+      const sourceBudget = (address: string | undefined) => {
+        if (!address) return undefined;
+        let source: string;
+        try {
+          source = ipaddr.process(address).toString();
+        } catch {
+          return undefined;
+        }
+        const now = Date.now();
+        let state = sourceStates.get(source);
+        if (!state) {
+          if (sourceStates.size >= 65536) {
+            for (const [key, candidate] of sourceStates)
+              if (candidate.sessions === 0 && now - candidate.lastSeen > 60000)
+                sourceStates.delete(key);
+            if (sourceStates.size >= 65536) return undefined;
+          }
+          state = { tokens: rule.burstEvents, updatedAt: now, lastSeen: now, sessions: 0 };
+          sourceStates.set(source, state);
+        }
+        const elapsed = Math.max(0, now - state.updatedAt) / 1000;
+        state.tokens = Math.min(rule.burstEvents, state.tokens + elapsed * rule.maxEventsPerSecond);
+        state.updatedAt = now;
+        state.lastSeen = now;
+        if (state.tokens < 1) return undefined;
+        state.tokens -= 1;
+        return { source, state };
+      };
       const family = isIP(rule.listenHost) === 6 ? "udp6" : "udp4";
       if (isIP(rule.targetHost) !== isIP(rule.listenHost))
         throw new Error("L4 listener and target address families must match");
       if (rule.protocol === "tcp") {
         const server = createServer({ pauseOnConnect: true }, (client) => {
+          const admission = sourceAllowed(client.remoteAddress, rule.sources)
+            ? sourceBudget(client.remoteAddress)
+            : undefined;
           if (
             stopped ||
             tcpClients.size / 2 >= Math.min(rule.maxConnections, limits.maxTcpConnections) ||
-            !sourceAllowed(client.remoteAddress, rule.sources)
+            !admission ||
+            admission.state.sessions >= rule.maxSessionsPerSource
           ) {
             client.destroy();
             return;
           }
+          admission.state.sessions++;
           tcpClients.add(client);
           client.setTimeout(rule.idleTimeoutMs, () => closeSocket(client));
           const upstream = createServerConnection(rule.targetHost, rule.target.port);
           tcpClients.add(upstream);
           upstream.setTimeout(rule.idleTimeoutMs, () => closeSocket(upstream));
+          let finished = false;
           const done = () => {
+            if (finished) return;
+            finished = true;
             tcpClients.delete(client);
             tcpClients.delete(upstream);
+            admission.state.sessions = Math.max(0, admission.state.sessions - 1);
+            admission.state.lastSeen = Date.now();
             closeSocket(client);
             closeSocket(upstream);
           };
@@ -222,14 +301,21 @@ export async function startL4Forwarders(
       >();
       listener.on("message", (packet, peer: RemoteInfo) => {
         if (stopped || !sourceAllowed(peer.address, rule.sources)) return;
+        const admission = sourceBudget(peer.address);
+        if (!admission) return;
         const key = `${peer.family}/${peer.address}/${peer.port}`;
         let session = clients.get(key);
         if (!session) {
-          if (clients.size >= rule.maxConnections || udpRelays.size >= limits.maxUdpSessions)
+          if (
+            clients.size >= rule.maxConnections ||
+            udpRelays.size >= limits.maxUdpSessions ||
+            admission.state.sessions >= rule.maxSessionsPerSource
+          )
             return;
           const relay = createSocket(family);
           session = { socket: relay, ready: false, queuedBytes: 0 };
           clients.set(key, session);
+          admission.state.sessions++;
           udpSessions.add(session);
           udpRelays.add(relay);
           let timer: NodeJS.Timeout;
@@ -240,6 +326,8 @@ export async function startL4Forwarders(
               clients.delete(key);
               udpRelays.delete(relay!);
               udpSessions.delete(session!);
+              admission.state.sessions = Math.max(0, admission.state.sessions - 1);
+              admission.state.lastSeen = Date.now();
               udpQueuedBytes -= session!.queuedBytes;
               session!.queuedBytes = 0;
               udpTimers.delete(timer);
@@ -258,6 +346,8 @@ export async function startL4Forwarders(
             clients.delete(key);
             udpRelays.delete(relay!);
             udpSessions.delete(session!);
+            admission.state.sessions = Math.max(0, admission.state.sessions - 1);
+            admission.state.lastSeen = Date.now();
             udpQueuedBytes -= session!.queuedBytes;
             session!.queuedBytes = 0;
             udpTimers.delete(session!.timer!);
@@ -271,9 +361,6 @@ export async function startL4Forwarders(
           relay.connect(rule.target.port, rule.targetHost, () => {
             session!.ready = true;
             refresh();
-            session!.queuedBytes -= packet.length;
-            udpQueuedBytes -= packet.length;
-            relay!.send(packet);
             for (const queued of pending.splice(0)) {
               session!.queuedBytes -= queued.length;
               udpQueuedBytes -= queued.length;
@@ -286,6 +373,8 @@ export async function startL4Forwarders(
             clients.delete(key);
             udpRelays.delete(relay);
             udpSessions.delete(session);
+            admission.state.sessions = Math.max(0, admission.state.sessions - 1);
+            admission.state.lastSeen = Date.now();
             clearTimeout(session.timer);
             udpTimers.delete(session.timer!);
             session.queuedBytes = 0;
@@ -296,6 +385,8 @@ export async function startL4Forwarders(
             clients.delete(key);
             udpRelays.delete(relay);
             udpSessions.delete(session);
+            admission.state.sessions = Math.max(0, admission.state.sessions - 1);
+            admission.state.lastSeen = Date.now();
             clearTimeout(session.timer);
             udpTimers.delete(session.timer!);
             relay.close();
@@ -314,6 +405,11 @@ export async function startL4Forwarders(
             clients.delete(key);
             udpRelays.delete(session!.socket);
             udpSessions.delete(session!);
+            const sourceState = sourceStates.get(ipaddr.process(peer.address).toString());
+            if (sourceState) {
+              sourceState.sessions = Math.max(0, sourceState.sessions - 1);
+              sourceState.lastSeen = Date.now();
+            }
             udpQueuedBytes -= session!.queuedBytes;
             session!.queuedBytes = 0;
             udpTimers.delete(session!.timer!);
