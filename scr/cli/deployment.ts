@@ -114,11 +114,13 @@ export async function readDeployment(path: string, platform?: PlatformName) {
             "body",
             "websocket",
             "browserCache",
+            "grpc",
             "relay",
           ].includes(key),
       ) ||
       typeof entry.pattern !== "string" ||
-      typeof entry.origin !== "string"
+      typeof entry.origin !== "string" ||
+      (entry.grpc !== undefined && typeof entry.grpc !== "boolean")
     )
       throw new Error("An origin route requires pattern and origin");
     const slash = entry.pattern.indexOf("/");
@@ -199,8 +201,19 @@ export async function readDeployment(path: string, platform?: PlatformName) {
         if (entry.secrets !== undefined || entry.upstreams !== undefined)
           throw new Error("Business secrets and upstream lists apply only to function origins");
         const address = new URL(entry.origin);
-        if (address.protocol !== "https:" || address.username || address.password || address.hash)
-          throw new Error("Origin address must use HTTPS without credentials or fragments");
+        const grpcLoopback =
+          entry.grpc === true &&
+          address.protocol === "http:" &&
+          ["127.0.0.1", "[::1]"].includes(address.hostname);
+        if (
+          (address.protocol !== "https:" && !grpcLoopback) ||
+          address.username ||
+          address.password ||
+          address.hash
+        )
+          throw new Error("Origin address must use HTTPS; gRPC may use explicit loopback h2c");
+        if (grpcLoopback && input.allowLoopbackHttp !== true)
+          throw new Error("Loopback gRPC h2c requires allowLoopbackHttp: true");
         name = `origin${index}`;
         while (
           Object.hasOwn(businesses, name) ||
@@ -253,6 +266,7 @@ export async function readDeployment(path: string, platform?: PlatformName) {
       authenticated: entry.authenticated ?? false,
       body: entry.body ?? "text",
       ...(entry.websocket === undefined ? {} : { websocket: entry.websocket }),
+      ...(entry.grpc === undefined ? {} : { grpc: entry.grpc }),
       ...(entry.browserCache === undefined ? {} : { browserCache: entry.browserCache }),
     });
   }

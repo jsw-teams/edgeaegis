@@ -3,9 +3,10 @@ import { once } from "node:events";
 import { originCredential } from "../config.js";
 import { digest, stableJson } from "../core/types.js";
 import { createRelayTransport } from "../origin/relay.js";
+import { createGrpcFetch } from "../runtime/grpc-node.js";
 import { type AllowlistEntry, createShield } from "../runtime/index.js";
 import { startL4Forwarders } from "../runtime/l4.js";
-import { createNodeServer } from "../runtime/node.js";
+import { createGrpcNodeServer, createNodeServer } from "../runtime/node.js";
 import { loadSecLangDeployment } from "../seclang/node.js";
 import { readCredentials, readData } from "./config.js";
 import { readBusinessFunction, readDeployment } from "./deployment.js";
@@ -17,6 +18,7 @@ function authorized(header: string | null, secret: string) {
   return given.length === expected.length && timingSafeEqual(given, expected);
 }
 export async function serve(path: string): Promise<void> {
+  const grpcTransport = createGrpcFetch();
   let fingerprint = "";
   async function candidate() {
     const { config, businesses } = await readDeployment(path);
@@ -74,6 +76,7 @@ export async function serve(path: string): Promise<void> {
         ...config.origins[name]!,
         originToken: originCredential(credentials, config.origins[name]!.key),
         allowLoopbackHttp: config.allowLoopbackHttp ?? false,
+        grpcFetch: grpcTransport.fetch,
         ...(originFetch ? { fetch: originFetch } : {}),
       };
     }
@@ -121,6 +124,8 @@ export async function serve(path: string): Promise<void> {
             if (!next) return;
             if (
               stableJson(next.config.listen) !== stableJson(current.config.listen) ||
+              stableJson(next.config.grpcListen ?? null) !==
+                stableJson(current.config.grpcListen ?? null) ||
               stableJson(next.config.l4Forwarders ?? []) !==
                 stableJson(current.config.l4Forwarders ?? []) ||
               stableJson(next.config.l4Limits ?? {}) !== stableJson(current.config.l4Limits ?? {})
@@ -157,13 +162,40 @@ export async function serve(path: string): Promise<void> {
     },
     () => current.config.publicHosts,
   );
+  const grpcServer = current.config.grpcListen
+    ? createGrpcNodeServer(
+        (request, incoming) =>
+          current.engine.handle(
+            request,
+            {
+              tenant: current.config.tenant,
+              verifiedClientIp: incoming.socket.remoteAddress ?? "127.0.0.1",
+              httpProtocol: "HTTP/2.0",
+              ...(current.credentials.clientToken &&
+              authorized(request.headers.get("authorization"), current.credentials.clientToken)
+                ? { identity: "configured-api-client" }
+                : {}),
+            },
+            incoming.url,
+          ),
+        () => current.config.publicHosts,
+      )
+    : undefined;
   server.listen(current.config.listen.port, current.config.listen.host);
   await once(server, "listening");
+  if (grpcServer && current.config.grpcListen) {
+    grpcServer.listen(current.config.grpcListen.port, current.config.grpcListen.host);
+    await once(grpcServer, "listening");
+  }
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("Missing TCP listener");
   process.stderr.write(
     `listening at http://${current.config.listen.host}:${address.port}; native SecLang\n`,
   );
+  if (grpcServer && current.config.grpcListen)
+    process.stderr.write(
+      `gRPC h2c at ${current.config.grpcListen.host}:${current.config.grpcListen.port}\n`,
+    );
   let stopping = false;
   const stop = () => {
     if (stopping) return;
@@ -171,6 +203,8 @@ export async function serve(path: string): Promise<void> {
     server.close(() => {
       current.engine.dispose();
     });
+    grpcServer?.close();
+    grpcTransport.close();
     void l4.close();
     server.closeIdleConnections();
     setTimeout(() => server.closeAllConnections(), 5000).unref();

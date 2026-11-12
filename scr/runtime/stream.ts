@@ -11,7 +11,7 @@ export function protectStream(
     complete: () => void;
   },
 ): ReadableStream<Uint8Array> {
-  requireInteger(options.maxBytes, 1, 1073741824, "stream bytes");
+  requireInteger(options.maxBytes, 1, Number.MAX_SAFE_INTEGER, "stream bytes");
   requireInteger(options.idleTimeoutMs, 1, 300000, "stream idle deadline");
   const reader = input.getReader();
   let controller: ReadableStreamDefaultController<Uint8Array>;

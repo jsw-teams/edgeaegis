@@ -37,7 +37,41 @@ From a source checkout, use `npm install` followed by the same platform commands
 
 The Node listener defaults to loopback. Put your TLS ingress in front of it and use a hostname configured in `origin/config.yml`.
 
-For a VPS deployment, `config.yml` can also declare fixed-target TCP/UDP Layer 4 forwarders. Every listener requires literal IP endpoints and an explicit source CIDR allowlist; each rule has a bounded session count, per-source session cap, token-bucket event rate and idle timeout. TCP streams use Node socket backpressure. Process-wide TCP/UDP defaults scale with detected host memory and can be raised with `l4Limits`; validated upper bounds are 65,536 concurrent sessions and 256 MiB of queued UDP packets. Raw Layer 4 payloads are not HTTP and cannot be inspected by SecLang; keep these rules limited to protocols that need transport forwarding. HTTP requests must pass through EdgeAegis before reaching an origin. Native gRPC is currently rejected with HTTP 501 pending its HTTP/2 streaming adapter; do not route gRPC directly to an origin. HTTP/3/QUIC must terminate at a trusted ingress that forwards only into EdgeAegis. Changing forwarder listeners or resource budgets requires a service restart.
+For a VPS deployment, `config.yml` can also declare fixed-target TCP/UDP Layer 4 forwarders. Every listener requires literal IP endpoints and an explicit source CIDR allowlist; each rule has a bounded session count, per-source session cap, token-bucket event rate and idle timeout. TCP streams use Node socket backpressure. Process-wide TCP/UDP defaults scale with detected host memory and can be raised with `l4Limits`; validated upper bounds are 65,536 concurrent sessions and 256 MiB of queued UDP packets. Raw Layer 4 payloads are not HTTP and cannot be inspected by SecLang; keep these rules limited to protocols that need transport forwarding. HTTP requests must pass through EdgeAegis before reaching an origin. Native gRPC uses a dedicated loopback-only HTTP/2 cleartext listener for trusted TLS ingress, then a multiplexed HTTP/2 upstream. Route, method, metadata, frame boundaries, response headers and trailers are handled; protobuf payloads remain opaque to SecLang. HTTP/3/QUIC must terminate at a trusted ingress that forwards only into EdgeAegis. Changing forwarder, gRPC or HTTP listeners requires a service restart.
+
+For VLESS over TLS and gRPC, terminate client TLS/HTTP3 at a trusted proxy and send the configured gRPC service path to `grpcListen`. Mark its fixed Xray loopback h2c origin as `grpc: true`; keep Xray bound to loopback. Set `allowLoopbackHttp: true` explicitly to permit that local h2c connection. Xray verifies the VLESS UUID. The public client and Xray server must use the same `serviceName` (normally the request path is `/<serviceName>/Tun`).
+
+Example Caddy routing (replace the service name with the matching Xray gRPC `serviceName`):
+
+```caddyfile
+api.js.gripe {
+	@xray path /xray-grpc/*
+	reverse_proxy @xray h2c://127.0.0.1:8788
+	reverse_proxy 127.0.0.1:8787
+}
+```
+
+This gives clients TLS at Caddy while keeping both EdgeAegis and Xray backends private. Permit TCP/UDP 443 at the public ingress as required by the selected HTTP/2 and HTTP/3 setup; do not publish ports 8788 or 10000.
+
+```yaml
+# VPS config.yml
+allowLoopbackHttp: true
+grpcListen:
+  host: 127.0.0.1
+  port: 8788
+```
+
+```yaml
+# origin/config.yml
+routes:
+  - pattern: api.js.gripe/<serviceName>/*
+    origin: http://127.0.0.1:10000
+    grpc: true
+    methods: [POST]
+    key: xray-local
+```
+
+Do not expose the Xray h2c port. Configure `limits.maxBodyBytes` as the largest accepted gRPC frame, and set ordinary HTTP/WebSocket routes separately on the standard listener.
 
 ```yaml
 l4Forwarders:
@@ -190,7 +224,7 @@ For public GET/HEAD content, add `browserCache: { maxAgeSeconds: 120 }` to a rou
 
 ## Limits and verification
 
-The 8 MB configuration-file read limit is separate from uploads. `limits.maxBodyBytes` checks actual streamed bytes, defaults to 8 MiB and is configurable up to 16 MiB. Complete CRS tests cover multipart uploads above 2 MiB and malicious neighboring fields. Individual transformed values, PCRE2 steps/depth/memory, concurrency and collections have enforced resource bounds; exhaustion rejects rather than becoming a non-match. Compressed request bodies and raw gRPC frames are not supported ingress forms. Explicit WebSocket routes inspect the real handshake and 101 headers while preserving native binary frames; opaque upgraded messages are outside SecLang inspection.
+The 8 MB configuration-file read limit is separate from uploads. `limits.maxBodyBytes` checks actual streamed bytes, defaults to 8 MiB and is configurable up to 16 MiB. Complete CRS tests cover multipart uploads above 2 MiB and malicious neighboring fields. Individual transformed values, PCRE2 steps/depth/memory, concurrency and collections have enforced resource bounds; exhaustion rejects rather than becoming a non-match. Compressed request bodies are not supported ingress forms. Explicit WebSocket routes inspect the real handshake and 101 headers while preserving native binary frames; opaque upgraded messages are outside SecLang inspection. Native gRPC routes validate framed boundaries and stream without whole-body buffering; SecLang evaluates request metadata and response headers while gRPC trailers pass through.
 
 ```sh
 npm run check
@@ -232,7 +266,7 @@ npm run deploy:cloudflare
 
 通过 SSH 在 Linux/VPS 长期运行时，使用 `npx edgeaegis service install config.yml --system` 安装 systemd 后台服务，使用 `npx edgeaegis service status config.yml --system` 查看状态。需要相应管理权限；`deploy:local` 是前台开发命令。安装 npm 包不会自动开启后台服务。
 
-VPS 的 `config.yml` 可声明固定目标 TCP/UDP 四层转发。每条规则都必须填写字面 IP 目标和来源 CIDR 白名单，并可设置每来源会话数、令牌桶速率与空闲超时。TCP 使用流式背压；TCP/UDP 进程级默认预算根据检测到的主机内存计算，也可通过 `l4Limits` 调高。经过校验的上限为 65,536 个并发会话和 256 MiB UDP 待发包内存。四层载荷不是 HTTP，不能由 SecLang 检查；HTTP 请求必须先经过 EdgeAegis 再到源站。原生 gRPC 目前仍返回 HTTP 501，HTTP/2 流式适配器完成前不要将 gRPC 直连源站。HTTP/3/QUIC 必须在受信入口终止，并且只转发至 EdgeAegis。修改四层监听或资源预算后需重启服务。不要使用 `0.0.0.0/0` 或 `::/0` 作为默认白名单。
+VPS 的 `config.yml` 可声明固定目标 TCP/UDP 四层转发。每条规则都必须填写字面 IP 目标和来源 CIDR 白名单，并可设置每来源会话数、令牌桶速率与空闲超时。TCP 使用流式背压；TCP/UDP 进程级默认预算根据检测到的主机内存计算，也可通过 `l4Limits` 调高。经过校验的上限为 65,536 个并发会话和 256 MiB UDP 待发包内存。四层载荷不是 HTTP，不能由 SecLang 检查；业务 HTTP 必须先经过 EdgeAegis。原生 gRPC 使用独立 loopback H2C 入口与 HTTP/2 上游；TLS/HTTP3 应由受信 ingress 终止，Xray h2c 端口只监听 loopback。`grpc: true` 路由支持 VLESS+TLS+gRPC，并由 Xray 校验 UUID。修改监听或资源预算后需重启服务。不要使用 `0.0.0.0/0` 或 `::/0` 作为默认白名单。
 
 上方 GIF 来自真实隔离虚拟机终端，演示多个业务、独立回源密钥、真实 curl 响应、完整 CRS 拦截与临时封禁到期恢复。全部示例地址和密钥属于一次性实验环境。CRS 定时跟踪最新稳定版，完整验证后才更新；来源提交与哈希用于核验，不作为永久锁定。白名单和自定义拒绝页面始终由部署者控制。
 

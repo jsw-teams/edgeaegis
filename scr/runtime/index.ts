@@ -19,6 +19,7 @@ import { type CompileSecLangOptions, compileSecLang, executeSecLang } from "../s
 import { type AllowlistEntry, createAllowlist } from "./allowlist.js";
 import { type BrowserCachePolicy, validateBrowserCache } from "./browser-cache.js";
 import { createErrorPages, type ErrorPages } from "./error-pages.js";
+import { isGrpcContentType, validateGrpcStream } from "./grpc.js";
 import { createProxy, type ProxyOptions } from "./proxy.js";
 
 export type { SecurityEvent, TrustedContext } from "../core/types.js";
@@ -36,6 +37,8 @@ export interface Route {
   body?: "json" | "text" | "none";
   /** Inspect the HTTP handshake; upgraded frames remain opaque to SecLang. */
   websocket?: boolean;
+  /** Native gRPC over HTTP/2; protobuf messages are framed and size-checked, not decoded by SecLang. */
+  grpc?: boolean;
   /** Opt-in client freshness for public origin responses, after full SecLang inspection. */
   browserCache?: BrowserCachePolicy;
 }
@@ -117,6 +120,7 @@ export async function createShield(input: ShieldOptions) {
       (route.prefix !== undefined && typeof route.prefix !== "boolean") ||
       !proxies.has(route.business) ||
       (route.websocket !== undefined && typeof route.websocket !== "boolean") ||
+      (route.grpc !== undefined && typeof route.grpc !== "boolean") ||
       !Array.isArray(route.methods) ||
       ![undefined, "none", "json", "text"].includes(route.body)
     )
@@ -124,6 +128,11 @@ export async function createShield(input: ShieldOptions) {
         "Routes require a configured business, explicit authenticated boolean, methods and a supported body profile",
       );
     if (
+      (route.grpc &&
+        (route.websocket ||
+          route.browserCache ||
+          route.body === "json" ||
+          !route.methods.includes("POST"))) ||
       canonicalPath(route.path) !== route.path ||
       (route.prefix
         ? prefixRoutes.some((other) => other.host === route.host && other.path === route.path)
@@ -246,17 +255,25 @@ export async function createShield(input: ShieldOptions) {
       if (!route) throw new ShieldError("unknown-route", 404);
       if (!route.methods.includes(request.method)) throw new ShieldError("method-not-allowed", 405);
       if (upgrade && !route.websocket) throw new ShieldError("websocket-route-required", 426);
+      const grpcRequest = isGrpcContentType(request.headers.get("content-type"));
+      if (grpcRequest && !route.grpc) throw new ShieldError("grpc-route-required", 404);
+      if (route.grpc && !grpcRequest) throw new ShieldError("grpc-content-type-required", 415);
+      if (grpcRequest && context.httpProtocol !== "HTTP/2.0")
+        throw new ShieldError("grpc-http2-required", 426);
       source = "identity";
       if (route.authenticated && !context.identity)
         throw new ShieldError("authentication-required", 401);
       source = "boundary";
-      const body = await readBody(request, limits);
-      const contentType = (request.headers.get("content-type") ?? "")
-        .split(";")[0]!
-        .trim()
-        .toLowerCase();
-      if (contentType === "application/grpc" || contentType.startsWith("application/grpc+"))
-        throw new ShieldError("native-grpc-requires-http2-ingress", 501);
+      let body: Uint8Array<ArrayBufferLike> = new Uint8Array();
+      let grpcBody: ReadableStream<Uint8Array> | undefined;
+      if (grpcRequest) {
+        if (!request.body) throw new ShieldError("grpc-body-required", 400);
+        grpcBody = validateGrpcStream(
+          request.body,
+          limits.maxBodyBytes,
+          request.headers.get("grpc-encoding"),
+        ) as ReadableStream<Uint8Array>;
+      } else body = await readBody(request, limits);
       if ((route.body ?? "none") === "none" && body.length)
         throw new ShieldError("body-not-allowed");
       let bodyText = "";
@@ -343,8 +360,36 @@ export async function createShield(input: ShieldOptions) {
         upgrade,
         context.identity ? undefined : route.browserCache,
         hooks.originFetches?.[route.business],
+        grpcBody,
+        grpcRequest,
       );
       if (response.status === 101) pendingUpgrade = response;
+      if (grpcRequest && nativeProgram && inspectResponse && nativeTransaction) {
+        const responseInput = {
+          ...nativeInput,
+          responseStatus: response.status,
+          responseHeaders: response.headers,
+        };
+        const result = executeSecLang(nativeProgram, responseInput, {
+          phases: [3, 5],
+          transaction: nativeTransaction,
+          shouldSkip: skipNativeRule,
+        });
+        if (result.blocked) {
+          await response.body?.cancel();
+          return denied(
+            request,
+            result.status,
+            "rule",
+            "seclang-response-rule-match",
+            `sec-${result.matched.at(-1)}`,
+          );
+        }
+        emit("allow", "proxy", "grpc-stream-forwarded-after-header-inspection");
+        streaming = response.body !== null;
+        pendingUpgrade = undefined;
+        return response;
+      }
       if (nativeProgram && inspectResponse && nativeTransaction) {
         const responseInput = {
           ...nativeInput,

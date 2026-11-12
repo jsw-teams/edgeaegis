@@ -19,6 +19,7 @@ export interface DeploymentConfig {
   upstreams?: Record<string, { url: string; binding?: string; key: string }>;
   origins: Record<string, { origin: string; allowedOrigins: string[]; key: string }>;
   listen: { host: "127.0.0.1" | "::1" | "0.0.0.0" | "::"; port: number };
+  grpcListen?: { host: "127.0.0.1" | "::1"; port: number };
   allowLoopbackHttp?: boolean;
   limits?: Partial<BoundaryLimits>;
   maxConcurrentRequests?: number;
@@ -56,6 +57,7 @@ export function validateDeploymentConfig(value: unknown): DeploymentConfig {
     "upstreams",
     "origins",
     "listen",
+    "grpcListen",
     "allowLoopbackHttp",
     "limits",
     "maxConcurrentRequests",
@@ -93,6 +95,19 @@ export function validateDeploymentConfig(value: unknown): DeploymentConfig {
     )
       throw new Error("Every route must select a configured business");
   }
+  if (
+    config.routes.some((route) => route.grpc) !== (config.grpcListen !== undefined) ||
+    (config.grpcListen !== undefined &&
+      (!config.grpcListen ||
+        Object.keys(config.grpcListen).some((key) => !["host", "port"].includes(key)) ||
+        !["127.0.0.1", "::1"].includes(config.grpcListen.host) ||
+        !Number.isInteger(config.grpcListen.port) ||
+        config.grpcListen.port < 1 ||
+        config.grpcListen.port > 65535))
+  )
+    throw new Error("gRPC routes require a dedicated loopback grpcListen port");
+  if (config.allowLoopbackHttp !== undefined && typeof config.allowLoopbackHttp !== "boolean")
+    throw new Error("allowLoopbackHttp must be a boolean");
   if (
     config.l4Forwarders !== undefined &&
     (!Array.isArray(config.l4Forwarders) || config.l4Forwarders.length > 64)

@@ -1,5 +1,6 @@
 import { type Fetch, requireInteger, ShieldError } from "../core/types.js";
 import { applyBrowserCache, type BrowserCachePolicy } from "./browser-cache.js";
+import { copyGrpcTrailers } from "./grpc-metadata.js";
 import { protectStream } from "./stream.js";
 
 export interface ProxyOptions {
@@ -10,6 +11,7 @@ export interface ProxyOptions {
   maxResponseBytes?: number;
   allowLoopbackHttp?: boolean;
   fetch?: Fetch;
+  grpcFetch?: Fetch;
 }
 const hop = [
   "connection",
@@ -63,6 +65,8 @@ export function createProxy(options: ProxyOptions) {
     websocket = false,
     browserCache?: BrowserCachePolicy,
     requestTransport?: Fetch,
+    grpcBody?: ReadableStream<Uint8Array>,
+    grpc = false,
   ): Promise<Response> => {
     if (Date.now() < openUntil) throw new ShieldError("origin-circuit-open", 503);
     const target = new URL(origin);
@@ -86,6 +90,7 @@ export function createProxy(options: ProxyOptions) {
     }
     headers.set("x-shield-origin-auth", originToken);
     headers.set("accept-encoding", "identity");
+    if (grpc) headers.set("te", "trailers");
     if (websocket) headers.set("upgrade", "websocket");
     const abort = new AbortController();
     let completed = false;
@@ -109,9 +114,19 @@ export function createProxy(options: ProxyOptions) {
         redirect: "manual",
         signal: abort.signal,
       };
-      if (!["GET", "HEAD"].includes(incoming.method) && body.length) init.body = body as BodyInit;
+      if (grpc) {
+        if (!grpcBody) throw new ShieldError("grpc-body-required", 400);
+        init.body = grpcBody;
+        (init as RequestInit & { duplex?: "half" }).duplex = "half";
+      } else if (!["GET", "HEAD"].includes(incoming.method) && body.length)
+        init.body = body as BodyInit;
       if (incoming.signal.aborted) throw new ShieldError("client-aborted", 408);
-      const upstream = await (requestTransport ?? transport)(target, init);
+      const upstream = await (
+        requestTransport ??
+        (grpc ? options.grpcFetch : undefined) ??
+        transport
+      )(target, init);
+      if (grpc) clearTimeout(timer);
       if (abort.signal.aborted) {
         void upstream.body?.cancel().catch(() => {});
         throw new ShieldError("origin-timeout-or-abort", 504);
@@ -174,20 +189,25 @@ export function createProxy(options: ProxyOptions) {
       ) {
         cleanup();
         void upstream.body?.cancel().catch(() => {});
-        return new Response(null, { status: upstream.status, headers: responseHeaders });
+        return copyGrpcTrailers(
+          upstream,
+          new Response(null, { status: upstream.status, headers: responseHeaders }),
+        );
       }
       const stream = protectStream(upstream.body, {
-        maxBytes: maxResponse,
-        idleTimeoutMs: timeout,
+        maxBytes: grpc ? Number.MAX_SAFE_INTEGER : maxResponse,
+        idleTimeoutMs: grpc ? 300000 : timeout,
         signal: abort.signal,
         abort: () => abort.abort(),
         complete: cleanup,
       });
-      return new Response(stream, {
+      const response = new Response(stream, {
         status: upstream.status,
         statusText: upstream.statusText,
         headers: responseHeaders,
       });
+      if (grpc) copyGrpcTrailers(upstream, response);
+      return response;
     } catch (error) {
       const wasAborted = abort.signal.aborted;
       cleanup();
