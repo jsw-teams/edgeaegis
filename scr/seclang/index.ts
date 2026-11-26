@@ -10,14 +10,28 @@ import { bodyProcessor, parseBody, xmlValues } from "./body.js";
 import { asciiLower, formEntries, fromOctets, octets, utf8Bytes } from "./bytes.js";
 import type { InjectionDetectors } from "./libinjection.js";
 import type { SecLangRegex, SecLangRegexBackend } from "./pcre2.js";
+import { createPhraseMatcher } from "./pm.js";
 import { expandSecLangSources, type SecLangSourceOptions, sourcePath } from "./sources.js";
 import { CollectionStore, collectionRecord } from "./state.js";
 import { transform, transformations } from "./transforms.js";
 import { defaultUnicodeMap, parseUnicodeMap } from "./unicode.js";
 
+const utf8Encoder = new TextEncoder();
+const utf8FatalDecoder = new TextDecoder("utf-8", { fatal: true });
+
+function parseIdRange(range: string): [number, number] {
+  const dash = range.indexOf("-");
+  if (dash < 0) {
+    const n = Number(range);
+    return [n, n];
+  }
+  return [Number(range.slice(0, dash)), Number(range.slice(dash + 1))];
+}
+
 export { createInjectionDetectors } from "./libinjection.js";
 export type { SecLangRegexBackend } from "./pcre2.js";
 export { createPCRE2Backend, PCRE2Error } from "./pcre2.js";
+export { compactSecLangFiles } from "./sources.js";
 
 export function splitActions(source) {
   const entries = [];
@@ -304,12 +318,16 @@ function compileOperator(text, phraseFiles, regexBackend, detectors, fileName) {
           ? ipaddr.parseCIDR(value)
           : [ipaddr.parse(value), ipaddr.parse(value).kind() === "ipv4" ? 32 : 128],
       );
+  const loweredPhrases = phrases?.map((phrase) => asciiLower(utf8Bytes(phrase)));
+  const phraseMatcher =
+    op === "pm" || op === "pmfromfile" ? createPhraseMatcher(loweredPhrases ?? []) : undefined;
   return {
     op,
     operand: utf8Bytes(operand),
     negated,
     regex,
-    phrases: phrases?.map((phrase) => asciiLower(utf8Bytes(phrase))),
+    phrases: loweredPhrases,
+    phraseMatcher,
     dynamic,
     detectors,
     ranges,
@@ -440,6 +458,8 @@ export interface CompileSecLangOptions extends SecLangSourceOptions {
   requestBodyLimit?: number;
   phraseFiles?: Record<string, string[]>;
   strict?: boolean;
+  /** Defer PCRE2 WASM compilation until a regex is first evaluated (after build-time strict validation). */
+  lazyRegex?: boolean;
   regexBackend?: SecLangRegexBackend;
   detectors?: InjectionDetectors;
 }
@@ -448,6 +468,7 @@ export function compileSecLang(
   {
     phraseFiles = {},
     strict = false,
+    lazyRegex = false,
     regexBackend,
     detectors,
     fileName,
@@ -483,10 +504,36 @@ export function compileSecLang(
     const underlying = regexBackend;
     regexBackend = {
       untracked: underlying,
-      compile(pattern) {
-        const regex = underlying.compile(pattern);
-        resources.add(regex);
-        return regex;
+      compile(pattern, options) {
+        if (!lazyRegex) {
+          const regex = underlying.compile(pattern, options);
+          resources.add(regex);
+          return regex;
+        }
+        let compiled: SecLangRegex | undefined;
+        let destroyed = false;
+        const ensure = () => {
+          if (destroyed || disposed) throw new Error("PCRE2 pattern was destroyed");
+          if (!compiled) {
+            compiled = underlying.compile(pattern, options);
+          }
+          return compiled;
+        };
+        const lazy: SecLangRegex = {
+          matcher(value) {
+            return ensure().matcher(value);
+          },
+          groupCount() {
+            return ensure().groupCount();
+          },
+          destroy() {
+            destroyed = true;
+            compiled?.destroy?.();
+            compiled = undefined;
+          },
+        };
+        resources.add(lazy);
+        return lazy;
       },
     };
   }
@@ -682,6 +729,7 @@ export function compileSecLang(
       } else {
         if (!actions.id) throw new Error("Root rule requires id");
         actions.phase ??= 2;
+        actions.numericId = Number(actions.id);
         if (ids.has(actions.id)) throw new Error(`Duplicate rule id ${actions.id}`);
         ids.add(actions.id);
         instructions.push(step);
@@ -720,6 +768,7 @@ export function compileSecLang(
     );
   }
   const executable = instructions.filter((item) => !item.invalid);
+  settings.removedRanges = settings.removedIds.map(parseIdRange);
   // Markers participate in every phase; keep their original positions for skipAfter.
   const phaseInstructions = new Map(
     [1, 2, 3, 4, 5].map((phase) => [
@@ -821,7 +870,8 @@ function values(selector, request, tx, phase, context = {}) {
       entries = [["REQUEST_FILENAME", context.filename]];
       break;
     case "REQUEST_BASENAME":
-      entries = [["REQUEST_BASENAME", context.filename.split("/").pop()]];
+      context.basename ??= context.filename.split("/").pop();
+      entries = [["REQUEST_BASENAME", context.basename]];
       break;
     case "REQUEST_PROTOCOL":
       if (!request.protocol)
@@ -866,8 +916,7 @@ function values(selector, request, tx, phase, context = {}) {
           ? [
               [
                 selector.name,
-                (request.bodyBytes?.length ??
-                  new TextEncoder().encode(request.bodyText ?? "").length) >
+                (request.bodyBytes?.length ?? utf8Encoder.encode(request.bodyText ?? "").length) >
                 context.program.requestBodyLimit
                   ? "1"
                   : "0",
@@ -915,7 +964,15 @@ function values(selector, request, tx, phase, context = {}) {
           : [];
       break;
     case "RESPONSE_HEADERS":
-      entries = phase >= 3 ? [...new Headers(request.responseHeaders ?? {}).entries()] : [];
+      if (phase >= 3) {
+        if (context.responseHeaderSource !== request.responseHeaders) {
+          context.responseHeaderSource = request.responseHeaders;
+          context.responseHeaderEntries = [
+            ...new Headers(request.responseHeaders ?? {}).entries(),
+          ].map(([k, v]) => [k, utf8Bytes(v)]);
+        }
+        entries = context.responseHeaderEntries;
+      } else entries = [];
       break;
     case "MATCHED_VARS":
       entries = [...(context.matchedVars ?? [])];
@@ -954,7 +1011,12 @@ function values(selector, request, tx, phase, context = {}) {
           : [];
       break;
     case "ARGS":
-      entries = [...getArgs, ...postArgs];
+      if (!postArgs.length) entries = getArgs;
+      else if (!getArgs.length) entries = postArgs;
+      else {
+        context.argsEntries ??= [...getArgs, ...postArgs];
+        entries = context.argsEntries;
+      }
       break;
     case "ARGS_GET":
       entries = getArgs;
@@ -963,19 +1025,21 @@ function values(selector, request, tx, phase, context = {}) {
       entries = postArgs;
       break;
     case "ARGS_GET_NAMES":
-      entries = getArgs.map(([k]) => [k, k]);
+      context.getArgsNames ??= getArgs.map(([k]) => [k, k]);
+      entries = context.getArgsNames;
       break;
     case "ARGS_POST_NAMES":
-      entries = postArgs.map(([k]) => [k, k]);
+      context.postArgsNames ??= postArgs.map(([k]) => [k, k]);
+      entries = context.postArgsNames;
       break;
-    case "ARGS_COMBINED_SIZE":
-      entries = [
-        [
-          "ARGS_COMBINED_SIZE",
-          String([...getArgs, ...postArgs].reduce((n, [k, v]) => n + k.length + v.length, 0)),
-        ],
-      ];
+    case "ARGS_COMBINED_SIZE": {
+      let size = 0;
+      for (let i = 0; i < getArgs.length; i++) size += getArgs[i][0].length + getArgs[i][1].length;
+      for (let i = 0; i < postArgs.length; i++)
+        size += postArgs[i][0].length + postArgs[i][1].length;
+      entries = [["ARGS_COMBINED_SIZE", String(size)]];
       break;
+    }
     case "REQUEST_BODY_LENGTH":
       entries =
         phase >= 2
@@ -983,8 +1047,7 @@ function values(selector, request, tx, phase, context = {}) {
               [
                 "REQUEST_BODY_LENGTH",
                 String(
-                  request.bodyBytes?.length ??
-                    new TextEncoder().encode(request.bodyText ?? "").length,
+                  request.bodyBytes?.length ?? utf8Encoder.encode(request.bodyText ?? "").length,
                 ),
               ],
             ]
@@ -998,29 +1061,42 @@ function values(selector, request, tx, phase, context = {}) {
         context.matchedName === undefined ? [] : [["MATCHED_VAR_NAME", context.matchedName]];
       break;
     case "ARGS_NAMES":
-      entries = [...getArgs, ...postArgs].map(([k]) => [k, k]);
+      if (!postArgs.length) {
+        context.getArgsNames ??= getArgs.map(([k]) => [k, k]);
+        entries = context.getArgsNames;
+      } else {
+        context.argsNames ??= [...getArgs, ...postArgs].map(([k]) => [k, k]);
+        entries = context.argsNames;
+      }
       break;
     case "REQUEST_COOKIES":
     case "REQUEST_COOKIES_NAMES":
-      context.cookieEntries ??= (headers.get("cookie") || "")
-        .split(/;\s*/)
-        .filter(Boolean)
-        .map((part) => {
-          const at = part.indexOf("=");
-          return [
-            at < 0 ? part.trim() : part.slice(0, at).trim(),
-            at < 0 ? "" : part.slice(at + 1),
-          ];
-        });
-      entries =
-        selector.name === "REQUEST_COOKIES"
-          ? context.cookieEntries
-          : context.cookieEntries.map(([k]) => [k, k]);
+      if (!context.cookieEntries) {
+        const rawCookie = headers.get("cookie");
+        context.cookieEntries = rawCookie
+          ? rawCookie
+              .split(/;\s*/)
+              .filter(Boolean)
+              .map((part) => {
+                const at = part.indexOf("=");
+                return [
+                  at < 0 ? part.trim() : part.slice(0, at).trim(),
+                  at < 0 ? "" : part.slice(at + 1),
+                ];
+              })
+          : [];
+      }
+      if (selector.name === "REQUEST_COOKIES") {
+        entries = context.cookieEntries;
+      } else {
+        context.cookieNames ??= context.cookieEntries.map(([k]) => [k, k]);
+        entries = context.cookieNames;
+      }
       break;
   }
   if (selector.key !== undefined)
     entries = entries.filter(([k]) => selectorKeyMatches(selector, k));
-  if (!BYTE_COLLECTIONS.has(selector.name))
+  if (!BYTE_COLLECTIONS.has(selector.name) && selector.name !== "RESPONSE_HEADERS")
     entries = entries.map(([key, value]) => [key, utf8Bytes(String(value))]);
   return entries;
 }
@@ -1059,7 +1135,7 @@ function integer(value) {
   return Number.isInteger(number) && number >= -2147483648 && number <= 2147483647 ? number : 0;
 }
 function compares(value, condition, tx, context) {
-  const { op, regex, phrases } = condition;
+  const { op, regex } = condition;
   const operand = condition.dynamic ? macro(condition.operand, tx, context) : condition.operand;
   switch (op) {
     case "streq":
@@ -1086,7 +1162,7 @@ function compares(value, condition, tx, context) {
       );
     case "validateutf8encoding": {
       try {
-        new TextDecoder("utf-8", { fatal: true }).decode(octets(value));
+        utf8FatalDecoder.decode(octets(value));
         return false;
       } catch {
         return true;
@@ -1106,10 +1182,8 @@ function compares(value, condition, tx, context) {
     case "rx":
       return regex.matcher(value).find();
     case "pm":
-    case "pmfromfile": {
-      const lower = asciiLower(value);
-      return phrases.some((phrase) => lower.includes(phrase));
-    }
+    case "pmfromfile":
+      return condition.phraseMatcher.test(asciiLower(value));
     case "eq":
       return integer(value) === integer(operand);
     case "lt":
@@ -1130,63 +1204,69 @@ function match(step, request, tx, phase, context) {
   }
   const source = getValues(step.selectors, request, tx, phase, context);
   context.matchedVars.length = 0;
+  if (!source.length) return false;
   let matched = false;
-  for (const [name, raw] of source) {
-    const candidates = [];
-    if (step.actions.multiMatch) {
-      let value = raw;
-      candidates.push(value);
-      for (const name of step.actions.transformations) {
-        const next = transformed(value, [name], context);
-        if (next !== value) candidates.push(next);
-        value = next;
-      }
-    } else candidates.push(transformed(raw, step.actions.transformations, context));
-    for (const value of candidates) {
-      let dynamicRegex = null;
-      if (step.operator.op === "rx" && step.operator.dynamic)
-        dynamicRegex = step.operator.dynamicRegexBackend.compile(
-          macro(step.operator.operand, tx, context),
-          { binary: true },
-        );
-      const condition = dynamicRegex ? { ...step.operator, regex: dynamicRegex } : step.operator;
-      try {
-        let result = false;
-        let matcher = null;
-        let capture: string | undefined;
-        if (step.actions.capture && step.operator.op === "rx") {
-          matcher = condition.regex.matcher(value);
-          result = matcher.find();
-        } else if (step.operator.op === "detectsqli") {
-          const detected = step.operator.detectors.sqli(value);
-          result = detected.matched;
-          capture = detected.fingerprint;
-        } else if (["pm", "pmfromfile"].includes(step.operator.op)) {
-          const lower = asciiLower(value);
-          const phrase = step.operator.phrases.find((p) => lower.includes(p));
-          result = phrase !== undefined;
-          if (result) {
-            const at = lower.indexOf(phrase);
-            capture = value.slice(at, at + phrase.length);
-          }
-        } else result = compares(value, condition, tx, context);
-        if (result && matcher) {
-          for (let i = 0; i <= condition.regex.groupCount(); i++) {
-            const group = matcher.group(i);
-            if (group !== null) tx.set(String(i), group);
-          }
+  const transforms = step.actions.transformations;
+  const hasTransforms = transforms.length > 0;
+  const isMulti = Boolean(step.actions.multiMatch);
+  const op = step.operator;
+  const evaluate = (name, value) => {
+    let dynamicRegex = null;
+    if (op.op === "rx" && op.dynamic)
+      dynamicRegex = op.dynamicRegexBackend.compile(macro(op.operand, tx, context), {
+        binary: true,
+      });
+    const condition = dynamicRegex ? { ...op, regex: dynamicRegex } : op;
+    try {
+      let result = false;
+      let matcher = null;
+      let capture: string | undefined;
+      if (step.actions.capture && op.op === "rx") {
+        matcher = condition.regex.matcher(value);
+        result = matcher.find();
+      } else if (op.op === "detectsqli") {
+        const detected = op.detectors.sqli(value);
+        result = detected.matched;
+        capture = detected.fingerprint;
+      } else if (op.op === "pm" || op.op === "pmfromfile") {
+        const lower = asciiLower(value);
+        if (step.actions.capture) {
+          capture = op.phraseMatcher.match(lower, value);
+          result = capture !== undefined;
+        } else {
+          result = op.phraseMatcher.test(lower);
         }
-        if (result && step.actions.capture && capture !== undefined) tx.set("0", capture);
-        if (step.operator.negated ? !result : result) {
-          matched = true;
-          context.matchedValue = value;
-          context.matchedName = name;
-          context.matchedVars.push([name, value]);
-          applyEffects(step.actions, tx, context);
+      } else result = compares(value, condition, tx, context);
+      if (result && matcher) {
+        for (let i = 0; i <= condition.regex.groupCount(); i++) {
+          const group = matcher.group(i);
+          if (group !== null) tx.set(String(i), group);
         }
-      } finally {
-        dynamicRegex?.destroy?.();
       }
+      if (result && step.actions.capture && capture !== undefined) tx.set("0", capture);
+      if (op.negated ? !result : result) {
+        matched = true;
+        context.matchedValue = value;
+        context.matchedName = name;
+        context.matchedVars.push([name, value]);
+        applyEffects(step.actions, tx, context);
+      }
+    } finally {
+      dynamicRegex?.destroy?.();
+    }
+  };
+  for (let s = 0; s < source.length; s++) {
+    const [name, raw] = source[s];
+    if (!isMulti) {
+      evaluate(name, hasTransforms ? transformed(raw, transforms, context) : raw);
+      continue;
+    }
+    let value = raw;
+    evaluate(name, value);
+    for (let t = 0; t < transforms.length; t++) {
+      const next = transformed(value, [transforms[t]], context);
+      if (next !== value) evaluate(name, next);
+      value = next;
     }
   }
   return matched;
@@ -1342,12 +1422,17 @@ function applyEffects(actions, tx, context) {
 function controls(actions, _program, _tx, context) {
   for (const control of actions.controls) {
     const { option, value } = control;
-    if (option === "ruleremovebyid") context.removedIds.push(value);
-    else if (option === "ruleremovebytag") context.removedTags.add(value);
+    if (option === "ruleremovebyid") {
+      context.removedIds.push(value);
+      context.removedRanges.push(parseIdRange(value));
+    } else if (option === "ruleremovebytag") context.removedTags.add(value);
     else if (option.startsWith("ruleremovetarget")) context.targetRemovals.push(control);
     else if (option === "requestbodyprocessor") {
       context.processor = value;
       context.body = undefined;
+      context.postArgsNames = undefined;
+      context.argsEntries = undefined;
+      context.argsNames = undefined;
     } else if (option === "forcerequestbodyvariable") context.forceBody = value === "On";
     else if (option === "ruleengine") context.engine = value;
     else if (option === "auditengine") context.auditEngine = value;
@@ -1413,6 +1498,7 @@ export function executeSecLang(
     matchedVars: [],
     uniqueId: crypto.randomUUID(),
     removedIds: [...program.settings.removedIds],
+    removedRanges: [...program.settings.removedRanges],
     removedTags: new Set(),
     targetRemovals: [],
     collections: new Map(),
@@ -1428,6 +1514,7 @@ export function executeSecLang(
   for (const record of context.collectionRecords.values()) program.collections.refresh(record);
   let blocked = false;
   let status = 403;
+  const ruleInfo = { id: undefined, msg: undefined, severity: undefined };
   for (const phase of phases) {
     if (blocked && phase !== 5) continue;
     context.phase = phase;
@@ -1456,23 +1543,43 @@ export function executeSecLang(
       }
       if (shouldSkip?.(rule.actions.id)) continue;
       if (context.engine === "Off") break;
-      if (
-        context.removedIds.some((range) => idMatches(rule.actions.id, range)) ||
-        rule.actions.tags.some((tag) => context.removedTags.has(tag))
-      )
-        continue;
-      context.excludedTargets = context.targetRemovals
-        .filter((control) =>
-          control.option.endsWith("byid")
-            ? idMatches(rule.actions.id, control.filter)
-            : rule.actions.tags.includes(control.filter),
-        )
-        .flatMap((control) => control.selectors);
-      context.rule = {
-        id: rule.actions.id,
-        msg: rule.actions.message,
-        severity: rule.actions.severity,
-      };
+      if (context.removedRanges.length) {
+        const nid = rule.actions.numericId;
+        let isRemoved = false;
+        for (let r = 0; r < context.removedRanges.length; r++) {
+          const [start, end] = context.removedRanges[r];
+          if (nid >= start && nid <= end) {
+            isRemoved = true;
+            break;
+          }
+        }
+        if (isRemoved) continue;
+      }
+      if (context.removedTags.size && rule.actions.tags.length) {
+        let isRemoved = false;
+        for (let t = 0; t < rule.actions.tags.length; t++) {
+          if (context.removedTags.has(rule.actions.tags[t])) {
+            isRemoved = true;
+            break;
+          }
+        }
+        if (isRemoved) continue;
+      }
+      if (context.targetRemovals.length) {
+        context.excludedTargets = context.targetRemovals
+          .filter((control) =>
+            control.option.endsWith("byid")
+              ? idMatches(rule.actions.id, control.filter)
+              : rule.actions.tags.includes(control.filter),
+          )
+          .flatMap((control) => control.selectors);
+      } else {
+        context.excludedTargets = undefined;
+      }
+      ruleInfo.id = rule.actions.id;
+      ruleInfo.msg = rule.actions.message;
+      ruleInfo.severity = rule.actions.severity;
+      context.rule = ruleInfo;
       let current = rule,
         allMatched = true;
       while (current) {

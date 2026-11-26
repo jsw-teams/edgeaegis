@@ -1,7 +1,12 @@
 import type { Fetch } from "../../core/types.js";
 import { createPortableRuntime, type PortableOptions } from "../runtime.js";
 export async function createCloudflareRuntime(options: PortableOptions) {
-  const runtime = await createPortableRuntime(options);
+  // Cloudflare Workers builds validate SecLang eagerly at build time; deferring PCRE2 regex
+  // compilation keeps cold starts well inside the Free plan's startup CPU and memory limits.
+  const runtime = await createPortableRuntime({
+    lazyRegex: true,
+    ...options,
+  });
   return {
     ...runtime,
     handle(request: Request, originFetches?: Record<string, Fetch>) {

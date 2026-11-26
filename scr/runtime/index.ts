@@ -58,6 +58,8 @@ export interface ShieldOptions {
   event?: (event: SecurityEvent) => void;
   /** Optional trusted static pages; JSON API responses remain the default. */
   errorPages?: ErrorPages;
+  /** Optional build-time policy digest to avoid hashing bundled rule text on Worker cold start. */
+  policyVersion?: string;
   now?: () => number;
 }
 
@@ -76,15 +78,18 @@ export async function createShield(input: ShieldOptions) {
     throw new Error("Invalid tenant/service");
   if (typeof input.secLang !== "string" || !input.secLang.trim())
     throw new Error("Native secLang input is required");
-  const version = await digest(
-    stableJson({
-      source: input.secLang,
-      files: input.secLangOptions?.files ?? {},
-      phraseFiles: input.secLangOptions?.phraseFiles ?? {},
-      fileName: input.secLangOptions?.fileName ?? "main.conf",
-      allowlist: options.allowlist,
-    }),
-  );
+  const version =
+    input.policyVersion && /^[a-f0-9]{64}$/.test(input.policyVersion)
+      ? input.policyVersion
+      : await digest(
+          stableJson({
+            source: input.secLang,
+            files: input.secLangOptions?.files ?? {},
+            phraseFiles: input.secLangOptions?.phraseFiles ?? {},
+            fileName: input.secLangOptions?.fileName ?? "main.conf",
+            allowlist: options.allowlist,
+          }),
+        );
   const proxies = new Map<string, ReturnType<typeof createProxy>>();
   for (const [name, origin] of Object.entries(options.origins)) {
     if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(name)) throw new Error("Invalid business name");
@@ -207,7 +212,7 @@ export async function createShield(input: ShieldOptions) {
         )
       );
     };
-    context = structuredClone(context);
+    context = { ...context };
     stats.requests++;
     if (disposed) return denied(request, 503, "boundary", "engine-closed");
     if (active >= maxConcurrent) return denied(request, 503, "boundary", "concurrency-capacity");

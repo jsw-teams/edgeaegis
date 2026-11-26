@@ -5,6 +5,30 @@ export interface SecLangSourceOptions {
   files?: Record<string, string>;
 }
 
+/**
+ * Strip comments from bundled SecLang rule and phrase files without altering
+ * `.conf` line numbers, reducing Worker bundle size and cold-start parse cost.
+ */
+export function compactSecLangFiles(files: Record<string, string> = {}): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [name, text] of Object.entries(files)) {
+    if (name.endsWith(".conf")) {
+      out[name] = text
+        .split(/\r?\n/)
+        .map((line) => (/^\s*#/.test(line) ? "" : line.trimEnd()))
+        .join("\n");
+    } else if (/\.(data|txt|ipset|list)$/.test(name)) {
+      out[name] = text
+        .split(/\r?\n/)
+        .filter((line) => line.trim() && !line.trimStart().startsWith("#"))
+        .join("\n");
+    } else {
+      out[name] = text;
+    }
+  }
+  return out;
+}
+
 export function sourcePath(base: string, relative: string): string {
   if (/^[A-Za-z]:|^[\\/]/.test(relative)) throw new Error("SecLang bundle paths must be relative");
   const parts = base.split("/").slice(0, -1);

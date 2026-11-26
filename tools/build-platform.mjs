@@ -6,8 +6,11 @@ import { readCredentials, readData } from "./.build/scr/cli/config.js";
 import { readDeployment } from "./.build/scr/cli/deployment.js";
 import { readResponsePages } from "./.build/scr/cli/responses.js";
 import { originCredential } from "./.build/scr/config.js";
-import { compileSecLang } from "./.build/scr/seclang/index.js";
+import { digest, stableJson } from "./.build/scr/core/types.js";
+import { compactSecLangFiles, compileSecLang } from "./.build/scr/seclang/index.js";
 import { loadSecLangDeployment } from "./.build/scr/seclang/node.js";
+
+export { compactSecLangFiles };
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export async function originTransportsModule(businesses, config, credentials, contexts = {}) {
@@ -68,12 +71,24 @@ export async function buildPlatform(
     );
   const program = compileSecLang(native.secLang, { ...native.secLangOptions, strict: true });
   program.dispose();
+  const compactFiles = compactSecLangFiles(native.secLangOptions.files);
+  const allowlist = config.allowlistFile ? await readData(config.allowlistFile) : [];
+  const policyVersion = await digest(
+    stableJson({
+      source: native.secLang,
+      files: compactFiles,
+      phraseFiles: {},
+      fileName: "main.conf",
+      allowlist,
+    }),
+  );
   const data = {
     config,
     credentials,
     source: native.secLang,
-    files: native.secLangOptions.files,
-    allowlist: config.allowlistFile ? await readData(config.allowlistFile) : [],
+    files: compactFiles,
+    allowlist,
+    policyVersion,
     errorPages: config.responses
       ? await readResponsePages(config.responses.directory, config.responses.contentSecurityPolicy)
       : {},
@@ -95,6 +110,9 @@ export async function buildPlatform(
   const result = await build({
     entryPoints: [resolve(root, `tools/.build/scr/adapters/${platform}/worker.js`)],
     bundle: true,
+    minifyWhitespace: true,
+    minifySyntax: true,
+    minifyIdentifiers: platform !== "edgeone",
     write: false,
     metafile: true,
     format: "esm",
@@ -115,7 +133,7 @@ export async function buildPlatform(
           api.onLoad({ filter: /.*/, namespace: "project" }, (args) => ({
             contents:
               args.path === "edgeaegis:deployment"
-                ? `export default ${JSON.stringify(data)};`
+                ? `export default JSON.parse(${JSON.stringify(JSON.stringify(data))});`
                 : args.path === "edgeaegis:origin"
                   ? origin
                   : wasmSource,

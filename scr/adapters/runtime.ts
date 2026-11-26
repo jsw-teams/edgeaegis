@@ -14,6 +14,8 @@ export interface PortableOptions {
   libinjection: WebAssembly.Module | BufferSource;
   allowlist: AllowlistEntry[];
   errorPages?: ErrorPages;
+  policyVersion?: string;
+  lazyRegex?: boolean;
   originFetches: Record<string, Fetch>;
 }
 /** Every deployment uses this compiler, byte parser, transaction and response inspector. */
@@ -26,10 +28,12 @@ export async function createPortableRuntime(options: PortableOptions) {
     secLang: options.source,
     secLangOptions: {
       files: options.files,
+      ...(options.lazyRegex ? { lazyRegex: true } : {}),
       regexBackend: await createPCRE2Backend(options.pcre2),
       detectors: await createInjectionDetectors(options.libinjection),
     },
     allowlist: options.allowlist,
+    ...(options.policyVersion ? { policyVersion: options.policyVersion } : {}),
     ...(options.errorPages ? { errorPages: options.errorPages } : {}),
     ...(options.config.limits ? { limits: options.config.limits } : {}),
     ...(options.config.maxConcurrentRequests

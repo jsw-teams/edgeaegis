@@ -1,5 +1,4 @@
 /** PCRE2 primitive backend. SecLang parsing, matching policy and state remain in EdgeAegis. */
-import { octets } from "./bytes.js";
 export interface SecLangRegex {
   matcher(value: string): { find(): boolean; group(index: number): string | null };
   groupCount(): number;
@@ -32,6 +31,9 @@ export class PCRE2Error extends Error {
   }
 }
 
+const SCRATCH_INPUT_SIZE = 4096;
+const SCRATCH_OUTPUT_SIZE = 16384;
+
 /** Pass a statically imported WebAssembly.Module in Workers; bytes also work in Node.js. */
 export async function createPCRE2Backend(
   module: WebAssembly.Module | BufferSource,
@@ -40,6 +42,8 @@ export async function createPCRE2Backend(
   if (![matchLimit, depthLimit, memoryLimit].every((n) => Number.isSafeInteger(n) && n > 0))
     throw new Error("Invalid PCRE2 resource limits");
   let exports: Exports;
+  let cachedBuffer: ArrayBuffer | null = null;
+  let cachedMem = new Uint8Array(0);
   const imports = {
     env: {
       emscripten_resize_heap(size: number) {
@@ -65,50 +69,89 @@ export async function createPCRE2Backend(
   exports.__wasm_call_ctors();
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
+
+  function mem(): Uint8Array {
+    const buffer = exports.memory.buffer;
+    if (buffer !== cachedBuffer) {
+      cachedBuffer = buffer;
+      cachedMem = new Uint8Array(buffer);
+    }
+    return cachedMem;
+  }
+
   function allocate(size: number) {
     const ptr = exports.malloc(size);
     if (!ptr) throw new PCRE2Error("PCRE2 allocation failed");
     return ptr;
   }
+
+  // Reusable scratch buffers eliminate 2x malloc/free per regex evaluation on Cloudflare Workers.
+  const scratchInputPtr = allocate(SCRATCH_INPUT_SIZE + 1);
+  const scratchOutputPtr = allocate(SCRATCH_OUTPUT_SIZE);
+  const scratchInfoPtr = allocate(256);
+  const scratchOffsetPtr = allocate(4);
+
   function textAt(ptr: number, capacity: number) {
-    const bytes = new Uint8Array(exports.memory.buffer, ptr, capacity);
+    const bytes = mem().subarray(ptr, ptr + capacity);
     const nul = bytes.indexOf(0);
     if (nul < 0) throw new PCRE2Error("Unterminated PCRE2 output");
     return decoder.decode(bytes.subarray(0, nul));
   }
-  function string(value: string, binary = false) {
-    const bytes = binary ? octets(value) : encoder.encode(value);
-    const ptr = allocate(bytes.length + 1);
-    new Uint8Array(exports.memory.buffer, ptr, bytes.length + 1).set(bytes);
-    new Uint8Array(exports.memory.buffer)[ptr + bytes.length] = 0;
-    return { ptr, length: bytes.length };
+
+  function writeBinary(value: string): { ptr: number; length: number; owned: boolean } {
+    const length = value.length;
+    const owned = length > SCRATCH_INPUT_SIZE;
+    const ptr = owned ? allocate(length + 1) : scratchInputPtr;
+    const view = mem();
+    for (let i = 0; i < length; i++) {
+      const code = value.charCodeAt(i);
+      if (code > 255) {
+        if (owned) exports.free(ptr);
+        throw new Error("SecLang byte string contains a non-byte character");
+      }
+      view[ptr + i] = code;
+    }
+    view[ptr + length] = 0;
+    return { ptr, length, owned };
   }
+
+  function writePattern(value: string, binary = false) {
+    if (binary) return writeBinary(value);
+    const bytes = encoder.encode(value);
+    const owned = bytes.length > SCRATCH_INPUT_SIZE;
+    const ptr = owned ? allocate(bytes.length + 1) : scratchInputPtr;
+    const view = mem();
+    view.set(bytes, ptr);
+    view[ptr + bytes.length] = 0;
+    return { ptr, length: bytes.length, owned };
+  }
+
   return {
     compile(pattern: string, { binary = false } = {}): SecLangRegex {
-      const encoded = string(pattern, binary);
-      const error = allocate(256);
-      const offset = allocate(4);
+      const encoded = writePattern(pattern, binary);
       let ptr = 0;
       try {
         // SecLang uses DOTALL and DOLLAR_ENDONLY by default; inline flags may override them.
-        ptr = exports.pcre2_wasm_compile(encoded.ptr, encoded.length, 0x30, error, offset, 0);
-        if (!ptr) throw new PCRE2Error(`PCRE2 compile: ${textAt(error, 256)}`);
+        ptr = exports.pcre2_wasm_compile(
+          encoded.ptr,
+          encoded.length,
+          0x30,
+          scratchInfoPtr,
+          scratchOffsetPtr,
+          0,
+        );
+        if (!ptr) throw new PCRE2Error(`PCRE2 compile: ${textAt(scratchInfoPtr, 256)}`);
       } finally {
-        exports.free(encoded.ptr);
-        exports.free(error);
-        exports.free(offset);
+        if (encoded.owned) exports.free(encoded.ptr);
       }
-      const info = allocate(256);
       let count: number;
       try {
-        if (exports.pcre2_wasm_pattern_info(ptr, info, 256) < 0)
+        if (exports.pcre2_wasm_pattern_info(ptr, scratchInfoPtr, 256) < 0)
           throw new PCRE2Error("PCRE2 pattern info failed");
-        count = JSON.parse(textAt(info, 256)).captureCount;
+        count = JSON.parse(textAt(scratchInfoPtr, 256)).captureCount;
       } catch (error) {
         exports.pcre2_wasm_free(ptr);
         throw error;
-      } finally {
-        exports.free(info);
       }
       return {
         groupCount: () => count,
@@ -121,10 +164,11 @@ export async function createPCRE2Backend(
           return {
             find() {
               if (!ptr) throw new PCRE2Error("PCRE2 pattern was destroyed");
-              const input = string(value, true);
+              const input = writeBinary(value);
               try {
-                for (let size = 16384; size <= 8 * 1024 * 1024; size *= 2) {
-                  const output = allocate(size);
+                for (let size = SCRATCH_OUTPUT_SIZE; size <= 8 * 1024 * 1024; size *= 2) {
+                  const ownedOutput = size > SCRATCH_OUTPUT_SIZE;
+                  const output = ownedOutput ? allocate(size) : scratchOutputPtr;
                   try {
                     const rc = exports.pcre2_wasm_match(
                       ptr,
@@ -145,7 +189,7 @@ export async function createPCRE2Backend(
                       throw new PCRE2Error(`PCRE2 match: ${textAt(output, size)}`, rc);
                     }
                     if (rc > 0) {
-                      const bytes = new Uint8Array(exports.memory.buffer, output, size);
+                      const bytes = mem().subarray(output, output + size);
                       const end = bytes.indexOf(0);
                       if (end < 0) throw new PCRE2Error("Unterminated PCRE2 match output");
                       let binary = "";
@@ -157,12 +201,12 @@ export async function createPCRE2Backend(
                     } else result = null;
                     return result !== null;
                   } finally {
-                    exports.free(output);
+                    if (ownedOutput) exports.free(output);
                   }
                 }
                 throw new PCRE2Error("PCRE2 capture output exceeds limit");
               } finally {
-                exports.free(input.ptr);
+                if (input.owned) exports.free(input.ptr);
               }
             },
             group(index: number) {

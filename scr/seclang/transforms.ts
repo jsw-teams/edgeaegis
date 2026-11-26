@@ -3,6 +3,7 @@ import { octets } from "./bytes.js";
 import { defaultUnicodeMap } from "./unicode.js";
 
 const whitespace = /[\t\n\v\f\r ]/g;
+const fatalUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
 const byte = (n: number) => String.fromCharCode(n & 255);
 const unicodeByte = (n: number) => byte(n >= 0xff01 && n <= 0xff5e ? n - 0xfee0 : n);
 const escapes: Record<string, string> = {
@@ -16,6 +17,7 @@ const escapes: Record<string, string> = {
 };
 
 export function urlDecode(value: string, unicode = false, mapping = defaultUnicodeMap): string {
+  if (!value.includes("%") && !value.includes("+")) return value;
   const pattern = unicode ? /%u([\da-f]{4})|%([\da-f]{2})|\+/gi : /%([\da-f]{2})|\+/gi;
   return value.replace(pattern, (...args: unknown[]) => {
     const text = args[0] as string;
@@ -47,15 +49,27 @@ function normalizePath(value: string): string {
 
 export const transformations: Record<string, (value: string) => string> = {
   none: (s) => s,
-  lowercase: (s) => s.replace(/[A-Z]/g, (c) => c.toLowerCase()),
-  uppercase: (s) => s.replace(/[a-z]/g, (c) => c.toUpperCase()),
+  lowercase: (s) => {
+    for (let i = 0; i < s.length; i++) {
+      const c = s.charCodeAt(i);
+      if (c >= 65 && c <= 90) return s.replace(/[A-Z]+/g, (part) => part.toLowerCase());
+    }
+    return s;
+  },
+  uppercase: (s) => {
+    for (let i = 0; i < s.length; i++) {
+      const c = s.charCodeAt(i);
+      if (c >= 97 && c <= 122) return s.replace(/[a-z]+/g, (part) => part.toUpperCase());
+    }
+    return s;
+  },
   trim: (s) => s.replace(/^[\t\n\v\f\r ]+|[\t\n\v\f\r ]+$/g, ""),
   trimleft: (s) => s.replace(/^[\t\n\v\f\r ]+/, ""),
   trimright: (s) => s.replace(/[\t\n\v\f\r ]+$/, ""),
   compresswhitespace: (s) => s.replace(/[\t\n\v\f\r ]+/g, " "),
   removewhitespace: (s) => s.replace(whitespace, ""),
-  removenulls: (s) => s.replace(/\0/g, ""),
-  replacenulls: (s) => s.replace(/\0/g, " "),
+  removenulls: (s) => (s.includes("\0") ? s.replace(/\0/g, "") : s),
+  replacenulls: (s) => (s.includes("\0") ? s.replace(/\0/g, " ") : s),
   urldecode: (s) => urlDecode(s),
   urldecodeuni: (s) => urlDecode(s, true),
   urlencode: (s) =>
@@ -83,61 +97,82 @@ export const transformations: Record<string, (value: string) => string> = {
     }
   },
   htmlentitydecode: (s) =>
-    s.replace(
-      /&#x([\da-f]+);?|&#(\d+);?|&(quot|amp|lt|gt|nbsp|apos);?/gi,
-      (original, hex, decimal, name) => {
-        if (hex || decimal) return byte(Number.parseInt(hex ?? decimal, hex ? 16 : 10));
-        return (
-          (
-            { quot: '"', amp: "&", lt: "<", gt: ">", nbsp: "\xa0", apos: "'" } as Record<
-              string,
-              string
-            >
-          )[name.toLowerCase()] ?? original
-        );
-      },
-    ),
+    s.includes("&")
+      ? s.replace(
+          /&#x([\da-f]+);?|&#(\d+);?|&(quot|amp|lt|gt|nbsp|apos);?/gi,
+          (original, hex, decimal, name) => {
+            if (hex || decimal) return byte(Number.parseInt(hex ?? decimal, hex ? 16 : 10));
+            return (
+              (
+                { quot: '"', amp: "&", lt: "<", gt: ">", nbsp: "\xa0", apos: "'" } as Record<
+                  string,
+                  string
+                >
+              )[name.toLowerCase()] ?? original
+            );
+          },
+        )
+      : s,
   jsdecode: (s) =>
-    s.replace(
-      /\\u([\da-f]{4})|\\x([\da-f]{2})|\\([0-3]?[0-7]{1,2})|\\([\s\S])/gi,
-      (_all, uni, hex, octal, other) =>
-        uni
-          ? unicodeByte(Number.parseInt(uni, 16))
-          : hex
+    s.includes("\\")
+      ? s.replace(
+          /\\u([\da-f]{4})|\\x([\da-f]{2})|\\([0-3]?[0-7]{1,2})|\\([\s\S])/gi,
+          (_all, uni, hex, octal, other) =>
+            uni
+              ? unicodeByte(Number.parseInt(uni, 16))
+              : hex
+                ? byte(Number.parseInt(hex, 16))
+                : octal
+                  ? byte(Number.parseInt(octal, 8))
+                  : (escapes[other] ?? other),
+        )
+      : s,
+  cssdecode: (s) =>
+    s.includes("\\")
+      ? s.replace(
+          /\\([\da-f]{1,6})(?:\r\n|[\t\n\f\r ])?|\\(?:\r\n|[\n\r\f])|\\([\s\S])/gi,
+          (_all, hex, other) => (hex ? unicodeByte(Number.parseInt(hex, 16)) : (other ?? "")),
+        )
+      : s,
+  escapeseqdecode: (s) =>
+    s.includes("\\")
+      ? s.replace(/\\x([\da-f]{2})|\\([0-3]?[0-7]{1,2})|\\([\s\S])/gi, (_all, hex, octal, other) =>
+          hex
             ? byte(Number.parseInt(hex, 16))
             : octal
               ? byte(Number.parseInt(octal, 8))
               : (escapes[other] ?? other),
-    ),
-  cssdecode: (s) =>
-    s.replace(
-      /\\([\da-f]{1,6})(?:\r\n|[\t\n\f\r ])?|\\(?:\r\n|[\n\r\f])|\\([\s\S])/gi,
-      (_all, hex, other) => (hex ? unicodeByte(Number.parseInt(hex, 16)) : (other ?? "")),
-    ),
-  escapeseqdecode: (s) =>
-    s.replace(/\\x([\da-f]{2})|\\([0-3]?[0-7]{1,2})|\\([\s\S])/gi, (_all, hex, octal, other) =>
-      hex
-        ? byte(Number.parseInt(hex, 16))
-        : octal
-          ? byte(Number.parseInt(octal, 8))
-          : (escapes[other] ?? other),
-    ),
+        )
+      : s,
   normalizepath: normalizePath,
   normalisepath: normalizePath,
-  normalizepathwin: (s) => normalizePath(s.replace(/\\/g, "/")),
-  normalisepathwin: (s) => normalizePath(s.replace(/\\/g, "/")),
+  normalizepathwin: (s) => normalizePath(s.includes("\\") ? s.replace(/\\/g, "/") : s),
+  normalisepathwin: (s) => normalizePath(s.includes("\\") ? s.replace(/\\/g, "/") : s),
   cmdline: (s) =>
     s
       .replace(/[\\"'^]/g, "")
       .replace(/[,;]/g, " ")
       .replace(/[\t\n\v\f\r ]+/g, " ")
       .replace(/ *([/(])/g, "$1")
-      .replace(/[A-Z]/g, (c) => c.toLowerCase()),
-  removecommentschar: (s) => s.replace(/\/\*|\*\/|--|#/g, ""),
-  replacecomments: (s) => s.replace(/\/\*[\s\S]*?(?:\*\/|$)/g, " "),
+      .replace(/[A-Z]+/g, (part) => part.toLowerCase()),
+  removecommentschar: (s) =>
+    s.includes("/*") || s.includes("*/") || s.includes("--") || s.includes("#")
+      ? s.replace(/\/\*|\*\/|--|#/g, "")
+      : s,
+  replacecomments: (s) => (s.includes("/*") ? s.replace(/\/\*[\s\S]*?(?:\*\/|$)/g, " ") : s),
   removecomments: (s) =>
-    s.replace(/\/\*[\s\S]*?(?:\*\/|$)|<!--[\s\S]*?(?:-->|$)|--[^\r\n]*|#[^\r\n]*/g, ""),
+    s.includes("/*") || s.includes("<!--") || s.includes("--") || s.includes("#")
+      ? s.replace(/\/\*[\s\S]*?(?:\*\/|$)|<!--[\s\S]*?(?:-->|$)|--[^\r\n]*|#[^\r\n]*/g, "")
+      : s,
   utf8tounicode: (s) => {
+    let hasHigh = false;
+    for (let i = 0; i < s.length; i++) {
+      if (s.charCodeAt(i) >= 128) {
+        hasHigh = true;
+        break;
+      }
+    }
+    if (!hasHigh) return s;
     const bytes = octets(s);
     let result = "";
     for (let i = 0; i < bytes.length; i++) {
@@ -156,7 +191,7 @@ export const transformations: Record<string, (value: string) => string> = {
               : 0;
       try {
         if (!size || i + size > bytes.length) throw new Error("Invalid UTF-8");
-        const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(i, i + size));
+        const text = fatalUtf8Decoder.decode(bytes.subarray(i, i + size));
         result += `%u${text.codePointAt(0)!.toString(16).padStart(4, "0")}`;
         i += size - 1;
       } catch {

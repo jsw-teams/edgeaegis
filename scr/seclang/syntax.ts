@@ -6,71 +6,88 @@ export interface SecLangStatement {
   raw: string;
   file?: string;
 }
+
+function isSpace(code: number): boolean {
+  return code === 32 || code === 9 || code === 13 || code === 10 || code === 12 || code === 11;
+}
+
 export function parseSecLangSyntax(input: string): SecLangStatement[] {
   if (typeof input !== "string") throw new TypeError("SecLang input must be text");
-  const statements = [];
+  const statements: SecLangStatement[] = [];
   let pending = "",
     start = 1;
   const lines = input.split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!.trim();
-    if (!pending && (!line || line.startsWith("#"))) continue;
+    if (!pending && (!line || line.charCodeAt(0) === 35)) continue;
     if (!pending) start = i + 1;
-    const backslashes = /\\+$/.exec(line)?.[0].length ?? 0;
-    const continued = backslashes % 2 === 1;
-    pending += (continued ? line.slice(0, -1) : line) + (continued ? " " : "");
-    if (!continued) {
-      statements.push({ line: start, raw: pending });
-      pending = "";
+    let backslashes = 0;
+    for (let j = line.length - 1; j >= 0 && line.charCodeAt(j) === 92; j--) backslashes++;
+    const continued = (backslashes & 1) === 1;
+    if (continued) {
+      pending += `${line.slice(0, -1)} `;
+      continue;
     }
-  }
-  if (pending) throw new Error(`Incomplete continuation at line ${start}`);
-  return statements.map(({ line, raw }) => {
-    const parts = [];
+    const raw = pending ? pending + line : line;
+    pending = "";
+    const parts: string[] = [];
     let part = "",
-      quote: string | null = null,
+      quote = 0,
       escaped = false,
-      started = false;
-    for (const ch of raw) {
+      started = false,
+      chunkStart = 0;
+    for (let j = 0; j < raw.length; j++) {
+      const code = raw.charCodeAt(j);
       if (escaped) {
-        if (ch === quote) part = part.slice(0, -1);
-        part += ch;
+        if (code === quote) {
+          if (j - 1 > chunkStart) part += raw.slice(chunkStart, j - 1);
+          chunkStart = j;
+        }
         escaped = false;
         continue;
       }
-      if (ch === "\\" && quote) {
-        part += ch;
+      if (code === 92 && quote) {
         escaped = true;
         continue;
       }
-      if ((ch === "'" || ch === '"') && !quote) {
-        quote = ch;
+      if ((code === 39 || code === 34) && !quote) {
+        if (j > chunkStart) part += raw.slice(chunkStart, j);
+        quote = code;
         started = true;
+        chunkStart = j + 1;
         continue;
       }
-      if (ch === quote) {
-        quote = null;
+      if (code === quote) {
+        if (j > chunkStart) part += raw.slice(chunkStart, j);
+        quote = 0;
+        chunkStart = j + 1;
         continue;
       }
-      if (!quote && /\s/.test(ch)) {
+      if (!quote && isSpace(code)) {
         if (started) {
+          if (j > chunkStart) part += raw.slice(chunkStart, j);
           parts.push(part);
           part = "";
           started = false;
         }
+        chunkStart = j + 1;
       } else {
-        part += ch;
         started = true;
       }
     }
-    if (quote) throw new Error(`Unterminated quote at line ${line}`);
-    if (started) parts.push(part);
+    if (quote) throw new Error(`Unterminated quote at line ${start}`);
+    if (started) {
+      if (raw.length > chunkStart) part += raw.slice(chunkStart);
+      parts.push(part);
+    }
     const [directive, ...args] = parts;
-    if (!directive) throw new Error(`Empty SecLang directive at line ${line}`);
+    if (!directive) throw new Error(`Empty SecLang directive at line ${start}`);
     if (directive === "SecRule" && (args.length < 2 || args.length > 3))
-      throw new Error(`Malformed SecRule at line ${line}`);
+      throw new Error(`Malformed SecRule at line ${start}`);
     if (directive === "SecAction" && args.length !== 1)
-      throw new Error(`Malformed SecAction at line ${line}`);
-    return { line, directive, args, raw };
-  });
+      throw new Error(`Malformed SecAction at line ${start}`);
+    statements.push({ line: start, directive, args, raw });
+  }
+  if (pending) throw new Error(`Incomplete continuation at line ${start}`);
+  return statements;
 }

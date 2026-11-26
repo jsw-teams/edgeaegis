@@ -22,8 +22,13 @@ export function octets(value: string): Uint8Array {
   return result;
 }
 
-export const asciiLower = (value: string): string =>
-  value.replace(/[A-Z]+/g, (part) => part.toLowerCase());
+export function asciiLower(value: string): string {
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code >= 65 && code <= 90) return value.replace(/[A-Z]+/g, (part) => part.toLowerCase());
+  }
+  return value;
+}
 
 export function formEntries(value: string, binary = false): [string, string][] {
   if (!value) return [];

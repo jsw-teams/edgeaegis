@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { test } from "node:test";
 import { build } from "esbuild";
 import { convertV4MiniflareOptions, Miniflare } from "miniflare";
+import { compactSecLangFiles } from "../../scr/seclang/sources.js";
 import { parseSecLangSyntax } from "../../scr/seclang/syntax.js";
 
 test("real workerd executes PCRE2 and libinjection from precompiled WASM bindings", {
@@ -110,6 +111,90 @@ test("real workerd executes PCRE2 and libinjection from precompiled WASM binding
     });
     assert.equal(responseAttack.status, 403);
     assert.ok(((await responseAttack.json()) as any).matched.includes("955100"));
+  } finally {
+    await mf.dispose();
+  }
+});
+
+test("real workerd runs Cloudflare Free lazyRegex + compacted CRS bundle with full SQLi/XSS/webshell blocking", {
+  timeout: 45000,
+}, async () => {
+  const sourceBundle = JSON.parse(
+    await readFile(new URL("../../rules/seclang-bundle.json", import.meta.url), "utf8"),
+  );
+  const compacted = {
+    source: sourceBundle.source,
+    files: compactSecLangFiles(sourceBundle.files),
+  };
+  const bundle = await build({
+    stdin: {
+      contents: `
+    import {compileSecLang,executeSecLang,createPCRE2Backend,createInjectionDetectors} from './scr/seclang/index.ts';
+    import PCRE2 from './pcre2.wasm';
+    import INJECTION from './libinjection.wasm';
+    const RULES = JSON.parse(${JSON.stringify(JSON.stringify(compacted))});
+    let vmPromise;
+    export default {async fetch(request){
+      vmPromise ??= Promise.all([createPCRE2Backend(PCRE2),createInjectionDetectors(INJECTION)]).then(([regexBackend,detectors])=>compileSecLang(RULES.source,{strict:true,lazyRegex:true,files:RULES.files,regexBackend,detectors}));
+      const vm=await vmPromise;
+      const input={url:request.url,method:request.method,protocol:'HTTP/2',remoteAddr:'192.0.2.9',headers:{host:'test','user-agent':'Mozilla/5.0',accept:'text/html'}};
+      const inc=executeSecLang(vm,input);
+      const res=inc.blocked?inc:executeSecLang(vm,{...input,responseStatus:200,responseHeaders:{'content-type':'text/html'},responseBody:request.headers.get('x-test-response')??'ok'},{phases:[3,4,5],transaction:inc.transaction});
+      return Response.json({blocked:res.blocked,matched:res.matched,rules:vm.sourceRules,unsupported:vm.unsupported.length},{status:res.status});
+    }};
+  `,
+      resolveDir: process.cwd(),
+    },
+    bundle: true,
+    minify: true,
+    format: "esm",
+    platform: "browser",
+    target: "es2022",
+    write: false,
+    external: ["*.wasm"],
+  });
+  const mf = new Miniflare(
+    convertV4MiniflareOptions({
+      cf: false,
+      modulesRoot: resolve("tools/.cache/seclang-workerd-free"),
+      modules: [
+        {
+          type: "ESModule",
+          path: resolve("tools/.cache/seclang-workerd-free/worker.mjs"),
+          contents: bundle.outputFiles[0]!.text,
+        },
+        {
+          type: "CompiledWasm",
+          path: resolve("tools/.cache/seclang-workerd-free/pcre2.wasm"),
+          contents: await readFile(new URL("../../scr/seclang/vendor/pcre2.wasm", import.meta.url)),
+        },
+        {
+          type: "CompiledWasm",
+          path: resolve("tools/.cache/seclang-workerd-free/libinjection.wasm"),
+          contents: await readFile(
+            new URL("../../scr/seclang/vendor/libinjection.wasm", import.meta.url),
+          ),
+        },
+      ],
+      compatibilityDate: "2026-10-01",
+    }),
+  );
+  try {
+    const ok = await mf.dispatchFetch("https://test/?name=example.com");
+    assert.equal(ok.status, 200);
+    const okJson = (await ok.json()) as any;
+    assert.equal(okJson.unsupported, 0);
+    assert.ok(okJson.rules >= 700);
+    const sqli = await mf.dispatchFetch(
+      `https://test/?q=${encodeURIComponent("1 UNION SELECT password FROM users")}`,
+    );
+    assert.equal(sqli.status, 403);
+    assert.ok(((await sqli.json()) as any).matched.includes("949110"));
+    const shell = await mf.dispatchFetch("https://test/", {
+      headers: { "x-test-response": "<title>=[ 1n73ct10n privat shell ]=</title>" },
+    });
+    assert.equal(shell.status, 403);
+    assert.ok(((await shell.json()) as any).matched.includes("955100"));
   } finally {
     await mf.dispose();
   }
